@@ -1,0 +1,9 @@
+dist/tests/
+dist/*.rsp
+checkpoints/
+__pycache__/
+HANDOFF-*.md
+COMPLETION-*.md
+RESUME.md
+save_checkpoint.py
+dist/TrueShuffle-source-*.zip

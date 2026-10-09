@@ -1,0 +1,20 @@
+{
+  "id": "dev.moshi.trueshuffle",
+  "name": "True Shuffle",
+  "version": "1.1.0",
+  "author": "moshi",
+  "description": "Choose equal-chance, no-repeat and discovery modes directly from the shuffle button. Supports the current queue, open playlist or whole library; changes playback only when you choose a mode or apply it.",
+  "type": "dotnet",
+  "entry": "TrueShuffle.dll",
+  "entryType": "TrueShuffle.TrueShufflePlugin",
+  "apiVersion": "1.2",
+  "minAppVersion": "1.5.9",
+  "homepage": "https://github.com/Alfamin/TrueShuffle",
+  "permissions": ["playback.control", "library.read", "menu.commands", "notifications"],
+  "settings": [
+    {"key":"open","label":"Open shuffle controls","type":"bool","default":false,"description":"Flip this switch to open the shuffle window. You can also right-click any song → True Shuffle…. Opening the window does not change playback."},
+    {"key":"mode","label":"Default mode","type":"choice","default":"No repeats","choices":["Equal chance","No repeats","Discovery","Never played only"]},
+    {"key":"scope","label":"Default source","type":"choice","default":"Current queue","choices":["Current queue","Open playlist","Whole library"]},
+    {"key":"skipDisliked","label":"Exclude disliked songs by default","type":"bool","default":false,"description":"Off: disliked songs have the same chance as other eligible songs. On: exclude them from all modes."}
+  ]
+}

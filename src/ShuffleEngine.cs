@@ -1,0 +1,96 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
+
+namespace TrueShuffle;
+
+public enum ShuffleMode { EqualChance, NoRepeats, Discovery, NeverPlayed }
+public sealed record Song(string Id, string Path, string Title, string Artist, int PlayCount,
+    bool Skip, bool Explicit, bool Disliked, DateTime? SnoozedUntil, bool Remote = false)
+{
+    public string Key => StableKey(Id, Path, Remote);
+    public static string StableKey(string id, string path, bool remote = false)
+    {
+        string value = "id:" + id;
+        if (!remote && !string.IsNullOrWhiteSpace(path))
+        {
+            value = System.IO.Path.GetFullPath(path);
+            if (OperatingSystem.IsWindows()) value = value.ToUpperInvariant();
+        }
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value)));
+    }
+}
+
+public sealed record ShufflePlan(IReadOnlyList<Song> Songs, IReadOnlyCollection<string> Seen,
+    bool NewCycle, int Eligible, int Unplayed);
+
+public static class ShuffleEngine
+{
+    public static List<Song> Eligible(IEnumerable<Song> songs, bool explicitAllowed, bool skipDisliked, DateTime now)
+        => songs.Where(s => !s.Skip && (explicitAllowed || !s.Explicit) && (!skipDisliked || !s.Disliked)
+               && (s.SnoozedUntil == null || s.SnoozedUntil <= now))
+            .DistinctBy(s => s.Key).ToList();
+
+    public static ShufflePlan Build(IEnumerable<Song> input, ShuffleMode mode, IEnumerable<string> remembered,
+        string? current, string? last, bool explicitAllowed = true, bool skipDisliked = false,
+        DateTime? now = null, Func<int, int>? draw = null)
+    {
+        draw ??= RandomNumberGenerator.GetInt32;
+        var pool = Eligible(input, explicitAllowed, skipDisliked, now ?? DateTime.UtcNow);
+        var seen = new HashSet<string>(remembered, StringComparer.Ordinal);
+        if (current != null) seen.Add(current);
+        var available = pool.Where(s => s.Key != current).ToList();
+        int unplayed = available.Count(s => s.PlayCount == 0);
+        bool reset = false;
+        List<Song> result;
+        if (mode == ShuffleMode.EqualChance) result = available;
+        else
+        {
+            if (mode == ShuffleMode.NeverPlayed) available = available.Where(s => s.PlayCount == 0).ToList();
+            result = available.Where(s => !seen.Contains(s.Key)).ToList();
+            if (result.Count == 0 && available.Count > 0 && mode != ShuffleMode.NeverPlayed)
+            {
+                foreach (var s in pool) seen.Remove(s.Key);
+                if (current != null) seen.Add(current);
+                result = available;
+                reset = true;
+            }
+        }
+        if (mode == ShuffleMode.Discovery)
+        {
+            result = result.GroupBy(s => Math.Max(0, s.PlayCount)).OrderBy(g => g.Key)
+                .SelectMany(g => Permute(g.ToList(), draw)).ToList();
+        }
+        else Permute(result, draw);
+        // At a new cycle boundary don't start with the last song again when there is an alternative.
+        // EqualChance stays a strictly uniform permutation and deliberately has no recency rule.
+        if (mode != ShuffleMode.EqualChance && result.Count > 1 && result[0].Key == last)
+        {
+            // Discovery's count order takes priority: never pull a familiar song ahead
+            // of an unplayed one merely to avoid a boundary repeat.
+            int alternatives = mode == ShuffleMode.Discovery
+                ? result.TakeWhile(s => Math.Max(0, s.PlayCount) == Math.Max(0, result[0].PlayCount)).Count() - 1
+                : result.Count - 1;
+            if (alternatives > 0)
+            {
+                int alternative = 1 + draw(alternatives);
+                (result[0], result[alternative]) = (result[alternative], result[0]);
+            }
+        }
+        return new(result, seen, reset, pool.Count, unplayed);
+    }
+
+    private static List<T> Permute<T>(List<T> list, Func<int, int> draw)
+    {
+        for (int i = list.Count - 1; i > 0; --i)
+        {
+            int j = draw(i + 1);
+            if (j < 0 || j > i) throw new InvalidOperationException("Invalid random draw");
+            (list[i], list[j]) = (list[j], list[i]);
+        }
+        return list;
+    }
+}
