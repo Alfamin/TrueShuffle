@@ -15,7 +15,7 @@ namespace TrueShuffle;
 
 public sealed class TrueShufflePlugin : INoctisPlugin
 {
-    public PluginInfo Info { get; } = new("dev.moshi.trueshuffle", "True Shuffle", "1.1.0", "moshi",
+    public PluginInfo Info { get; } = new("dev.moshi.trueshuffle", "True Shuffle", "1.1.1", "moshi",
         "Equal-chance shuffle, persistent no-repeat cycles, and discovery modes for your queue, playlist or library.");
     private IPluginHost? _host;
     private IDisposable? _command;
@@ -31,6 +31,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
     private string? _last, _historyError;
     private bool _closed, _busy, _ownChange;
     private int _epoch, _pending;
+    private string? _buttonError;
 
     public void Initialize(IPluginHost host)
     {
@@ -105,11 +106,15 @@ public sealed class TrueShufflePlugin : INoctisPlugin
                 () => { EndSession(); ((ICommand)QueueBridge.Get(_bridge!.Player, "ToggleShuffleCommand")!).Execute(null); },
                 Open, Notice);
             _buttons.Refresh(desktop.Windows);
+            _buttonError = null;
         }
         catch (Exception ex)
         {
-            _buttonTimer?.Stop();
-            Notice("Shuffle-button menu unavailable: " + ex.GetBaseException().Message + " Use the song's True Shuffle menu instead.");
+            var message = ex.GetBaseException().Message;
+            // A window/player may still be loading. Keep retrying without repeating notices.
+            if (_buttonError != message)
+                Notice("Shuffle-button menu unavailable: " + message + " Use the song's True Shuffle menu instead.");
+            _buttonError = message;
         }
     }
 

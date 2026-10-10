@@ -87,6 +87,8 @@ internal static class ShuffleTests
             Check(rejected && File.ReadAllText(Path.Combine(temp, "cycle.json")) == "invalid history", "Corrupt history preserved rather than silently reset");
             await File.WriteAllTextAsync(Path.Combine(temp, "cycle.json"), old);
 
+            Check(QueueBridge.FindAppend(typeof(OptionalAppend),typeof(IList<FakeTrack>)) != null,"Noctis 1.6 optional append signature accepted");
+            Check(QueueBridge.FindAppend(typeof(IncompatibleAppend),typeof(IList<FakeTrack>)) == null,"Unknown required queue arguments refused");
             var main = new FakeMain();
             var bridge = new QueueBridge(main, enforceHostTypes: false);
             var entries = bridge.Snapshot("Whole library");
@@ -144,7 +146,7 @@ internal static class ShuffleTests
         Console.WriteLine("Installed track type: " + track.FullName + "; assembly: " + track.Assembly.GetName().Name);
         Check(main.GetProperty("Player")?.PropertyType == player && main.GetField("_library", BindingFlags.Instance | BindingFlags.NonPublic) != null, "Installed main-window bridge contract");
         var replace = player.GetMethod("ReplaceQueueAndPlay", new[] { typeof(IList<>).MakeGenericType(track), typeof(int) });
-        Check(replace != null && player.GetMethod("ClearQueue", Type.EmptyTypes) != null && player.GetMethod("AddRangeToQueue", new[] { typeof(IList<>).MakeGenericType(track) }) != null, "Installed queue methods match tested bridge");
+        Check(replace != null && player.GetMethod("ClearQueue", Type.EmptyTypes) != null && QueueBridge.FindAppend(player, typeof(IList<>).MakeGenericType(track)) != null, "Installed queue methods match tested bridge, including 1.6 optional arguments");
         Check(new[] { "AutoplayEnabled", "RepeatMode", "IsRadioActive", "IsShuffleEnabled", "CurrentTrack", "UpNext", "ToggleShuffleCommand" }.All(p => player.GetProperty(p) != null), "Installed player state contract");
         Check(new[] { "Id", "FilePath", "Title", "Artist", "PlayCount", "SkipWhenShuffling", "IsExplicit", "IsDisliked", "SnoozedUntil", "IsRemoteStream" }.All(p => track.GetProperty(p) != null), "Installed track snapshot contract");
         var settings = app.GetType("Noctis.ViewModels.SettingsViewModel", true)!;
@@ -155,6 +157,8 @@ internal static class ShuffleTests
 }
 
 public enum FakeRepeat { Off, All, One }
+public sealed class OptionalAppend { public void AddRangeToQueue(IList<FakeTrack> tracks,string? sourceName=null,bool announce=true){} }
+public sealed class IncompatibleAppend { public void AddRangeToQueue(IList<FakeTrack> tracks,string sourceName,bool announce){} }
 public sealed class FakeTrack
 {
     public string Id { get; set; } = ""; public string FilePath => ""; public string Title => "Track " + Id;

@@ -1,7 +1,7 @@
 {
   "id": "dev.moshi.trueshuffle",
   "name": "True Shuffle",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "author": "moshi",
   "description": "Choose equal-chance, no-repeat and discovery modes directly from the shuffle button. Supports the current queue, open playlist or whole library; changes playback only when you choose a mode or apply it.",
   "type": "dotnet",

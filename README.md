@@ -1,5 +1,10 @@
 # True Shuffle for Noctis
 
+Version 1.1.1 restores shuffle-button menus on Noctis 1.6.0. The queue adapter accepts the new
+optional source/announcement arguments as well as the previous method signature. Menu discovery
+keeps retrying if the player is not ready yet. Native playback and menu tests run against the
+locally installed Noctis with synthetic tracks and no-op audio.
+
 Four shuffle modes for the current queue, open playlist, or whole library. Built and tested against
 Noctis **1.5.9**, plugin kit **1.2**, on Windows. Opening or enabling the plugin does not change playback.
 Click **Apply shuffle** to replace the upcoming queue; the current song keeps playing by default.

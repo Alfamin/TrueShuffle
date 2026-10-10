@@ -39,7 +39,9 @@ public sealed class QueueBridge
         _trackType = parameter.GetGenericArguments()[0];
         if (enforceHostTypes && _trackType.FullName != "Noctis.Models.Track") throw Changed();
         _clear = Player.GetType().GetMethod("ClearQueue", Type.EmptyTypes) ?? throw Changed();
-        _add = Player.GetType().GetMethod("AddRangeToQueue", new[] { parameter }) ?? throw Changed();
+        // 1.6 added optional sourceName/announce arguments. Reflection must supply them;
+        // GetMethod with the old one-argument signature no longer finds the method.
+        _add = FindAppend(Player.GetType(), parameter) ?? throw Changed();
         foreach (string p in new[] { "AutoplayEnabled", "RepeatMode", "IsRadioActive", "IsShuffleEnabled" })
             if (Property(Player, p)?.CanWrite != true || Property(Player, p)?.CanRead != true) throw Changed();
         foreach (string p in new[] { "AutoplayEnabled", "IsRadioActive", "IsShuffleEnabled" })
@@ -98,7 +100,7 @@ public sealed class QueueBridge
             try
             {
                 _clear.Invoke(Player, null);
-                _add.Invoke(Player, new object[] { list });
+                Append(list);
             }
             catch (Exception failed)
             {
@@ -107,13 +109,22 @@ public sealed class QueueBridge
                 if (!ReferenceEquals(Get(Player, "CurrentTrack"), previousCurrent)) throw;
                 var restore = (IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(_trackType))!;
                 foreach (var track in original) restore.Add(track);
-                try { _clear.Invoke(Player, null); _add.Invoke(Player, new object[] { restore }); }
+                try { _clear.Invoke(Player, null); Append(restore); }
                 catch (Exception recovery) { throw new AggregateException("Queue application and recovery failed. No music files were changed.", failed, recovery); }
                 throw new InvalidOperationException("Shuffle could not be applied. Previous upcoming songs were restored; built-in Shuffle is off.", failed);
             }
         }
         else _replace.Invoke(Player, new object[] { list, 0 });
     }
+
+    public static MethodInfo? FindAppend(Type player, Type listType) => player.GetMethods(BindingFlags.Instance | BindingFlags.Public)
+        .SingleOrDefault(m => m.Name == "AddRangeToQueue" && m.ReturnType==typeof(void) && (
+            m.GetParameters() is var p && p.Length >= 1 && p[0].ParameterType == listType &&
+            (p.Length == 1 || (p.Length == 3 && p[1].ParameterType == typeof(string) && p[1].IsOptional &&
+                p[2].ParameterType == typeof(bool) && p[2].IsOptional))));
+
+    private void Append(IList tracks) => _add.Invoke(Player, _add.GetParameters().Length == 1
+        ? new object?[] { tracks } : new object?[] { tracks, null, false });
 
     private TrackEntry Wrap(object t)
     {
