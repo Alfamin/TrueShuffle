@@ -8,7 +8,7 @@ using System.Threading.Tasks;
 
 namespace TrueShuffle;
 
-public sealed record CycleData(int Version, string[] Seen, string? Last);
+public sealed record CycleData(int Version, string[] Seen, string? Last, string? LastPath = null);
 
 /// <summary>Only this plugin's private file is written. No Noctis settings/history/database edits.</summary>
 public sealed class CycleStore
@@ -36,7 +36,7 @@ public sealed class CycleStore
         var data = JsonSerializer.Deserialize<CycleData>(buffer.ToArray())
             ?? throw new IOException("Shuffle history is empty or invalid.");
         if (data.Version != 1 || data.Seen == null || data.Seen.Length > MaxKeys ||
-            data.Seen.Any(k => !ValidKey(k)) || (data.Last != null && !ValidKey(data.Last)))
+            data.Seen.Any(k => !ValidKey(k)) || (data.Last != null && !ValidKey(data.Last)) || (data.LastPath != null && !ValidKey(data.LastPath)))
             throw new IOException("Shuffle history has an unsupported format; it was left untouched.");
         return data with { Seen = data.Seen.Distinct(StringComparer.Ordinal).ToArray() };
     }
@@ -44,7 +44,7 @@ public sealed class CycleStore
     public async Task SaveAsync(CycleData data)
     {
         if (data.Version != 1 || data.Seen.Length > MaxKeys || data.Seen.Any(k => !ValidKey(k)) ||
-            (data.Last != null && !ValidKey(data.Last))) throw new IOException("Shuffle history is invalid or exceeds its limit.");
+            (data.Last != null && !ValidKey(data.Last)) || (data.LastPath != null && !ValidKey(data.LastPath))) throw new IOException("Shuffle history is invalid or exceeds its limit.");
         await _gate.WaitAsync();
         string? temp = null;
         try

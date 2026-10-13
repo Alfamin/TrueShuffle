@@ -48,6 +48,14 @@ public sealed class ShuffleButtonMenu : IDisposable
         }
     }
 
+    public bool Open(Window window)
+    {
+        var button=_buttons.Keys.FirstOrDefault(b=>b.GetVisualAncestors().Contains(window));
+        if (button == null) return false;
+        _buttons[button].Menu.Open(button);
+        return true;
+    }
+
     private ContextMenu BuildMenu()
     {
         var items = new List<Control> { new MenuItem { Header = "Current queue", IsEnabled = false } };

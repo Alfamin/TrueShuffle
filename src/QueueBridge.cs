@@ -57,6 +57,7 @@ public sealed class QueueBridge
     }
 
     public TrackEntry? Current => Get(Player, "CurrentTrack") is object t ? Wrap(t) : null;
+    public TrackEntry Entry(object native)=>Wrap(native);
     public bool ExplicitAllowed => Get(_main, "Settings") is object s ? (bool)(Get(s, "AllowExplicitContent") ?? throw Changed()) : throw Changed();
 
     public List<TrackEntry> Snapshot(string scope)
@@ -132,7 +133,8 @@ public sealed class QueueBridge
         return new(t, new Song(Get(t, "Id")!.ToString()!, (string)Get(t, "FilePath")!,
             (string)Get(t, "Title")!, (string)Get(t, "Artist")!, (int)Get(t, "PlayCount")!,
             (bool)Get(t, "SkipWhenShuffling")!, (bool)Get(t, "IsExplicit")!, (bool)Get(t, "IsDisliked")!,
-            (DateTime?)Get(t, "SnoozedUntil"), (bool)Get(t, "IsRemoteStream")!));
+            (DateTime?)Get(t, "SnoozedUntil"), (bool)Get(t, "IsRemoteStream")!,
+            Song.StableKey(Get(t, "Id")!.ToString()!, (string)Get(t, "FilePath")!, (bool)Get(t, "IsRemoteStream")!)));
     }
     internal static PropertyInfo? Property(object o, string p) => o.GetType().GetProperty(p, BindingFlags.Instance | BindingFlags.Public);
     internal static object? Get(object o, string p) => Property(o, p)?.GetValue(o);

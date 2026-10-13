@@ -124,6 +124,7 @@ internal static class ShuffleTests
                 VerifyInstalledContract(args[0]);
             }
             UiTests.Run(Check);
+            CompatibilityTests.Run(Check);
             if (args.Length > 0) NativePlayerTests.Run(args[0], Check);
             Console.WriteLine($"PASS: {_passed} assertions; no real playback, library writes or network calls.");
             return 0;

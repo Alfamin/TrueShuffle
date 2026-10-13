@@ -51,6 +51,20 @@ internal static class NativePlayerTests
                 bridge.Apply(new[] { entries[2], entries[1] }, true);
                 check(ReferenceEquals(first, Get(player, "CurrentTrack")) && audio.Calls.Count(c => c == "Play") == plays, "Installed native queue adapter never restarts current audio");
                 check(bridge.Snapshot("Current queue").Select(e => e.Song.Title).SequenceEqual(new[] { "Synthetic 1", "Synthetic 3", "Synthetic 2" }), "Installed native queue receives exact custom order");
+                using(var priority=new QueueFrontPolicy(player,_=>{},message=>throw new Exception(message)))
+                {
+                    playerType.GetMethod("AddToQueue")!.Invoke(player,new object[]{tracks[1]!,false});Dispatcher.UIThread.RunJobs();
+                    check(bridge.Snapshot("Current queue").Select(e=>e.Song.Title).SequenceEqual(new[]{"Synthetic 1","Synthetic 2","Synthetic 3"}),"Actual Add to Queue puts an already queued song next without a duplicate");
+                    var block=(IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(trackType))!;
+                    block.Add(tracks[2]);block.Add(tracks[1]);
+                    QueueBridge.FindAppend(playerType,typeof(IList<>).MakeGenericType(trackType))!.Invoke(player,new object?[]{block,null,false});Dispatcher.UIThread.RunJobs();
+                    check(bridge.Snapshot("Current queue").Select(e=>e.Song.Title).SequenceEqual(new[]{"Synthetic 1","Synthetic 3","Synthetic 2"}),"Actual multi-song addition stays together in chosen order at the front");
+                    check(ReferenceEquals(first,Get(player,"CurrentTrack")) && audio.Calls.Count(c=>c=="Play")==plays,"Queue priority never restarts or interrupts current audio");
+                    playerType.GetMethod("AddToQueue")!.Invoke(player,new object[]{tracks[0]!,false});
+                    playerType.GetMethod("ClearQueue")!.Invoke(player,null);Dispatcher.UIThread.RunJobs();
+                    check(!((IEnumerable)Get(player,"UpNext")!).Cast<object>().Any(),"Clearing before pending promotion never resurrects a requested row");
+                }
+                bridge.Apply(new[]{entries[2],entries[1]},true);
                 ((ICommand)Get(player, "NextCommand")!).Execute(null); Dispatcher.UIThread.RunJobs();
                 check(Get(Get(player, "CurrentTrack")!, "Title")!.ToString() == "Synthetic 3", "Actual native Next consumes first custom song");
                 audio.Raise("TrackEnded"); Dispatcher.UIThread.RunJobs();
@@ -59,6 +73,22 @@ internal static class NativePlayerTests
                 check(!bridge.Snapshot("Current queue").Any(e => e.Song.Title != "Synthetic 2") && !(bool)Get(player, "IsPlaying")!, "Actual queue drain does not choose biased Autoplay or repeat");
             }
             check(audio.Calls.Contains("Play") && !library.Calls.Any(c => c == "ScanAsync" || c == "ImportFilesAsync"), "Native integration uses fake audio and never scans real music");
+            var big=(IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(trackType))!;
+            for(int i=0;i<2000;i++)
+            {
+                var item=Activator.CreateInstance(trackType)!;Set(item,"Id",Guid.NewGuid());Set(item,"Title","Prepared "+i);
+                Set(item,"FilePath",Path.Combine(Path.GetTempPath(),"prepared-shuffle-"+i+".flac"));big.Add(item);
+            }
+            playerType.GetMethod("ClearQueue")!.Invoke(player,null);
+            QueueBridge.FindAppend(playerType,typeof(IList<>).MakeGenericType(trackType))!.Invoke(player,new object?[]{big,null,false});Dispatcher.UIThread.RunJobs();
+            var playing=Get(player,"CurrentTrack");int played=audio.Calls.Count(c=>c=="Play");
+            using(var priority=new QueueFrontPolicy(player,_=>{},message=>throw new Exception(message)))
+            {
+                playerType.GetMethod("AddToQueue")!.Invoke(player,new object[]{big[1500]!,false});Dispatcher.UIThread.RunJobs();
+                var upcoming=((IEnumerable)Get(player,"UpNext")!).Cast<object>().ToArray();
+                check(upcoming.Length==2000 && ReferenceEquals(upcoming[0],big[1500]) && ReferenceEquals(upcoming[1],big[0]),"Requested song takes first position in an actual 2,000-song shuffle without duplicating it");
+                check(ReferenceEquals(playing,Get(player,"CurrentTrack")) && played==audio.Calls.Count(c=>c=="Play"),"Large queue promotion leaves current audio untouched");
+            }
         }
         finally
         {

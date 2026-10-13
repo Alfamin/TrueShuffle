@@ -15,20 +15,22 @@ namespace TrueShuffle;
 
 public sealed class TrueShufflePlugin : INoctisPlugin
 {
-    public PluginInfo Info { get; } = new("dev.moshi.trueshuffle", "True Shuffle", "1.1.1", "moshi",
+    public PluginInfo Info { get; } = new("dev.moshi.trueshuffle", "True Shuffle", "1.1.2", "moshi",
         "Equal-chance shuffle, persistent no-repeat cycles, and discovery modes for your queue, playlist or library.");
     private IPluginHost? _host;
     private IDisposable? _command;
+    private ShuffleShortcut? _shortcut;
     private ShuffleWindow? _window;
     private QueueBridge? _bridge;
     private ShuffleButtonMenu? _buttons;
     private DispatcherTimer? _buttonTimer;
     private PlaybackLease? _lease;
+    private QueueFrontPolicy? _priority;
     private CycleStore? _store;
     private Task _load = Task.CompletedTask, _save = Task.CompletedTask;
     private HashSet<string> _seen = new(StringComparer.Ordinal);
     private HashSet<string> _session = new(StringComparer.Ordinal);
-    private string? _last, _historyError;
+    private string? _last, _lastPath, _historyError;
     private bool _closed, _busy, _ownChange;
     private int _epoch, _pending;
     private string? _buttonError;
@@ -38,13 +40,22 @@ public sealed class TrueShufflePlugin : INoctisPlugin
         _host = host;
         _closed = false;
         _busy = false;
-        _seen = new(StringComparer.Ordinal); _last = null; _historyError = null;
+        _seen = new(StringComparer.Ordinal); _last = null; _lastPath = null; _historyError = null;
         int epoch = ++_epoch;
         _store = new CycleStore(host.DataDirectory);
         _load = LoadAsync(_store, epoch);
         _command = host.RegisterTrackCommand("True Shuffle…", null, (Action<TrackInfo>)(_ => Open()));
         host.Settings.Changed += SettingsChanged;
         host.NowPlaying.TrackChanged += TrackChanged;
+        _shortcut = new ShuffleShortcut(
+            _ => Application.Current?.ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop && desktop.MainWindow?.DataContext is object main ? QueueBridge.Get(main,"Settings") : null,
+            window => window.GetType().FullName is "Noctis.Views.MainWindow" or "Noctis.Views.MiniPlayerWindow",
+            () => _host?.Settings.GetString("shortcut"), window =>
+            {
+                if (_closed) return;
+                RefreshButtons(null,EventArgs.Empty);
+                if (_buttons?.Open(window) != true) Open();
+            }, Notice);
         _buttonTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
         _buttonTimer.Tick += RefreshButtons; _buttonTimer.Start();
         host.Log("ready; playback remains unchanged until Apply shuffle is clicked");
@@ -56,7 +67,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
         {
             await _save;
             var data = await store.LoadAsync();
-            await Dispatcher.UIThread.InvokeAsync(() => { if (!_closed && epoch == _epoch) { _seen = new(data.Seen, StringComparer.Ordinal); _last = data.Last; } });
+            await Dispatcher.UIThread.InvokeAsync(() => { if (!_closed && epoch == _epoch) { _seen = new(data.Seen, StringComparer.Ordinal); _last = data.Last; _lastPath = data.LastPath; } });
         }
         catch (Exception ex) { if (!_closed && epoch == _epoch) _historyError = ex.Message; }
     }
@@ -143,6 +154,8 @@ public sealed class TrueShufflePlugin : INoctisPlugin
                 throw new IOException("Remembered progress is unavailable. Use Equal chance, or inspect the plugin's cycle.json before continuing.");
             var bridge = _bridge;
             var entries = bridge.Snapshot(scope);
+            var upgraded = ShuffleEngine.UpgradeHistory(bridge.Snapshot("Whole library").Select(e=>e.Song),_seen,_last,_lastPath);
+            _seen = new(upgraded.Seen,StringComparer.Ordinal); _last=upgraded.Last;
             var current = bridge.Current?.Song;
             string? currentKey = keepCurrent ? current?.Key : null;
             bool explicitAllowed = bridge.ExplicitAllowed;
@@ -166,18 +179,29 @@ public sealed class TrueShufflePlugin : INoctisPlugin
             var ordered = plan.Songs.Select(s => native[s.Key]).ToList();
             var previousSeen = new HashSet<string>(_seen, StringComparer.Ordinal);
             var previousLast = _last;
+            var previousLastPath = _lastPath;
             EndSession(cancelPending: false);
             _ownChange = true;
             try
             {
                 _lease = new PlaybackLease(bridge.Player);
-                _session = ordered.Select(e => e.Song.Key).ToHashSet(StringComparer.Ordinal);
-                if (currentKey != null) _session.Add(currentKey);
+                _session = ordered.SelectMany(e => new[]{e.Song.Key,e.Song.LegacyKey}).ToHashSet(StringComparer.Ordinal);
+                if (currentKey != null) { _session.Add(currentKey); _session.Add(current!.LegacyKey); }
                 _seen = new(plan.Seen, StringComparer.Ordinal);
                 if (bridge.Player is INotifyPropertyChanged events) events.PropertyChanged += PlayerChanged;
                 bridge.Apply(ordered, keepCurrent);
+                if (QueueBridge.Get(bridge.Player,"UpNext") is System.Collections.Specialized.INotifyCollectionChanged)
+                    _priority=new QueueFrontPolicy(bridge.Player, requested=>
+                    {
+                        foreach(var track in requested)
+                        {
+                            var song=bridge.Entry(track).Song;
+                            _session.Add(song.Key);_session.Add(song.LegacyKey);
+                        }
+                        Notice($"{requested.Count} song{(requested.Count==1 ? "" : "s")} added next, ahead of the shuffle.");
+                    },Notice);
             }
-            catch { _seen = previousSeen; _last = previousLast; EndSession(); throw; }
+            catch { _seen = previousSeen; _last = previousLast; _lastPath = previousLastPath; EndSession(); throw; }
             finally { _ownChange = false; }
             MarkCurrent(persist: false);
             QueueSave();
@@ -195,7 +219,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
         try
         {
             var current = _bridge?.Current?.Song;
-            if (current != null && !_session.Contains(current.Key)) { EndSession(); return; }
+            if (current != null && !_session.Contains(current.Key) && !_session.Contains(current.LegacyKey)) { EndSession(); return; }
             MarkCurrent();
         }
         catch (Exception ex) { Notice("Progress tracking stopped: " + ex.GetBaseException().Message); EndSession(); }
@@ -204,10 +228,12 @@ public sealed class TrueShufflePlugin : INoctisPlugin
     private void MarkCurrent(bool persist = true)
     {
         var song = _bridge?.Current?.Song;
-        if (song != null && _session.Contains(song.Key))
+        if (song != null && (_session.Contains(song.Key) || _session.Contains(song.LegacyKey)))
         {
-            bool changed = _seen.Add(song.Key) || _last != song.Key;
+            bool changed = _seen.Add(song.Key);
+            changed = _seen.Add(song.LegacyKey) || changed || _last != song.Key;
             _last = song.Key;
+            _lastPath = song.LegacyKey;
             if (changed && persist && !_ownChange) QueueSave();
         }
     }
@@ -233,7 +259,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
     private void QueueSave()
     {
         if (_historyError != null || _store == null) return;
-        var snapshot = new CycleData(1, _seen.ToArray(), _last);
+        var snapshot = new CycleData(1, _seen.ToArray(), _last, _lastPath);
         var store = _store;
         int epoch = _epoch;
         // Chain immutable snapshots in order, so rapid Next clicks cannot persist older progress last.
@@ -262,7 +288,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
         await _load;
         if (_closed || epoch != _epoch) return;
         if (_historyError != null) { Notice("Invalid history was preserved. Inspect cycle.json in the plugin data folder."); return; }
-        _seen.Clear(); _last = null;
+        _seen.Clear(); _last = null; _lastPath = null;
         if (_lease != null) MarkCurrent();
         QueueSave();
         if (_window != null) _window.Status = "Remembered cycle reset. The playing queue was kept.";
@@ -271,6 +297,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
     private void EndSession(bool cancelPending = true)
     {
         if (cancelPending) ++_pending;
+        _priority?.Dispose(); _priority=null;
         if (_bridge?.Player is INotifyPropertyChanged events) events.PropertyChanged -= PlayerChanged;
         _session.Clear();
         var lease = _lease; _lease = null;
@@ -291,6 +318,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
         ++_epoch; ++_pending;
         if (_buttonTimer != null) { _buttonTimer.Stop(); _buttonTimer.Tick -= RefreshButtons; _buttonTimer = null; }
         _buttons?.Dispose(); _buttons = null;
+        _shortcut?.Dispose(); _shortcut = null;
         if (_host != null)
         {
             _host.Settings.Changed -= SettingsChanged;

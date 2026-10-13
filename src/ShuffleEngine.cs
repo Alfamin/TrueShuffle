@@ -9,10 +9,15 @@ namespace TrueShuffle;
 
 public enum ShuffleMode { EqualChance, NoRepeats, Discovery, NeverPlayed }
 public sealed record Song(string Id, string Path, string Title, string Artist, int PlayCount,
-    bool Skip, bool Explicit, bool Disliked, DateTime? SnoozedUntil, bool Remote = false)
+    bool Skip, bool Explicit, bool Disliked, DateTime? SnoozedUntil, bool Remote = false, string? IdentityKey = null)
 {
-    public string Key => StableKey(Id, Path, Remote);
+    public string Key => IdentityKey ?? StableKey(Id, Path, Remote);
+    public string LegacyKey => PathKey(Id, Path, Remote);
     public static string StableKey(string id, string path, bool remote = false)
+        => !remote && !string.IsNullOrWhiteSpace(path) && FileIdentity.Read(path) is string identity
+            ? Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity))) : PathKey(id, path, remote);
+
+    private static string PathKey(string id, string path, bool remote)
     {
         string value = "id:" + id;
         if (!remote && !string.IsNullOrWhiteSpace(path))
@@ -29,6 +34,17 @@ public sealed record ShufflePlan(IReadOnlyList<Song> Songs, IReadOnlyCollection<
 
 public static class ShuffleEngine
 {
+    /// <summary>Retain legacy aliases so atomic tag replacement at the same path keeps progress too.</summary>
+    public static CycleData UpgradeHistory(IEnumerable<Song> songs, IEnumerable<string> remembered, string? last, string? lastPath = null)
+    {
+        var seen = new HashSet<string>(remembered, StringComparer.Ordinal);
+        foreach (var song in songs)
+        {
+            if (seen.Contains(song.LegacyKey)) seen.Add(song.Key);
+            if (last == song.LegacyKey || (last != null && lastPath == song.LegacyKey)) last = song.Key;
+        }
+        return new(1, seen.ToArray(), last, lastPath);
+    }
     public static List<Song> Eligible(IEnumerable<Song> songs, bool explicitAllowed, bool skipDisliked, DateTime now)
         => songs.Where(s => !s.Skip && (explicitAllowed || !s.Explicit) && (!skipDisliked || !s.Disliked)
                && (s.SnoozedUntil == null || s.SnoozedUntil <= now))
@@ -53,7 +69,7 @@ public static class ShuffleEngine
             result = available.Where(s => !seen.Contains(s.Key)).ToList();
             if (result.Count == 0 && available.Count > 0 && mode != ShuffleMode.NeverPlayed)
             {
-                foreach (var s in pool) seen.Remove(s.Key);
+                foreach (var s in pool) { seen.Remove(s.Key); seen.Remove(s.LegacyKey); }
                 if (current != null) seen.Add(current);
                 result = available;
                 reset = true;

@@ -1,12 +1,22 @@
 # True Shuffle for Noctis
 
-Version 1.1.1 restores shuffle-button menus on Noctis 1.6.0. The queue adapter accepts the new
+Version 1.1.2 makes the Shuffle key open the same mode menu as the button. It follows Noctis's
+live shortcut binding (Ctrl+S by default); set the plugin's Shuffle shortcut to `off` for native
+keyboard shuffle. Shortcut recording, editing windows and plugin shutdown release the keys.
+Same-drive Windows moves/renames now retain no-repeat history using the file's identity. Existing
+path history migrates when a shuffle is applied; independent copies remain separate songs.
+While a custom shuffle is active, **Add to Queue** puts your requested songs next, ahead of the
+prepared shuffle. Multi-song additions keep their order, and an older upcoming copy of the same
+song is removed so the request does not play twice. The current song keeps playing. Normal Noctis
+queue behavior returns when you end the custom session or disable True Shuffle.
+
+Version 1.1.1 restored shuffle-button menus on Noctis 1.6.0. The queue adapter accepts the new
 optional source/announcement arguments as well as the previous method signature. Menu discovery
 keeps retrying if the player is not ready yet. Native playback and menu tests run against the
 locally installed Noctis with synthetic tracks and no-op audio.
 
 Four shuffle modes for the current queue, open playlist, or whole library. Built and tested against
-Noctis **1.5.9**, plugin kit **1.2**, on Windows. Opening or enabling the plugin does not change playback.
+Noctis **1.6.3**, plugin kit **1.2**, on Windows (minimum app version remains 1.5.9). Opening or enabling the plugin does not change playback.
 Click **Apply shuffle** to replace the upcoming queue; the current song keeps playing by default.
 
 ## Install and use
