@@ -55,6 +55,16 @@ internal static class ShuffleTests
             Check(never.Songs.Count == 1 && never.Songs[0].Id == "3", "Never played excludes both played and remembered starts");
             var emptyNever = ShuffleEngine.Build(small, ShuffleMode.NeverPlayed, small.Select(s => s.Key), null, null);
             Check(emptyNever.Songs.Count == 0 && !emptyNever.NewCycle, "Never played never silently falls back");
+            var waiting = new HashSet<string> { small[1].Key };
+            var withoutWaiting = ShuffleEngine.Build(small, ShuffleMode.NoRepeats, Array.Empty<string>(), null, null, draw: R(5), upcoming: waiting);
+            Check(withoutWaiting.Songs.Count == 3 && withoutWaiting.Songs.All(s => s.Key != small[1].Key), "A later plan leaves out the songs that are already upcoming");
+            var cycled = ShuffleEngine.Build(small, ShuffleMode.NoRepeats, small.Select(s => s.Key), small[0].Key, null, draw: R(5), upcoming: waiting);
+            Check(cycled.NewCycle && cycled.Songs.Count == 2 && cycled.Songs.All(s => s.Key != small[1].Key && s.Key != small[0].Key), "A fresh cycle also keeps out what is upcoming and what is playing");
+            var heard = new HashSet<string> { S(2).Key }; var rightNow = DateTime.UtcNow;
+            Check(ShuffleEngine.StillWanted(S(1), ShuffleMode.NoRepeats, heard, true, false, rightNow) && !ShuffleEngine.StillWanted(S(2), ShuffleMode.NoRepeats, heard, true, false, rightNow)
+                && ShuffleEngine.StillWanted(S(2), ShuffleMode.EqualChance, heard, true, false, rightNow) && !ShuffleEngine.StillWanted(S(3, 1), ShuffleMode.NeverPlayed, heard, true, false, rightNow)
+                && !ShuffleEngine.StillWanted(S(4) with { Skip = true }, ShuffleMode.EqualChance, heard, true, false, rightNow),
+                "A song taken from a plan later is checked against the rules of the mode again");
             var gated = new[] { S(1), S(2) with { Skip = true }, S(3) with { Explicit = true }, S(4) with { SnoozedUntil = DateTime.UtcNow.AddHours(1) }, S(5, disliked: true) };
             Check(ShuffleEngine.Build(gated, ShuffleMode.EqualChance, Array.Empty<string>(), null, null, explicitAllowed: false, skipDisliked: true).Songs.Single().Id == "1", "Eligibility respects skips, snoozes, explicit toggle and chosen dislike exclusion");
             Check(ShuffleEngine.Build(new[] { S(1), S(1) }, ShuffleMode.EqualChance, Array.Empty<string>(), null, null).Songs.Count == 1, "Duplicate ids deduplicated");
@@ -93,6 +103,13 @@ internal static class ShuffleTests
             var bridge = new QueueBridge(main, enforceHostTypes: false);
             var entries = bridge.Snapshot("Whole library");
             Check(entries.Count == 3 && bridge.ExplicitAllowed, "Bridge snapshots full library and host policy");
+            Check(bridge.SnapshotRaw("Whole library").Select(r => r.Entry().Song).SequenceEqual(entries.Select(e => e.Song)), "Raw snapshot resolves to exactly the same songs");
+            string identityFile = Path.Combine(temp, "identity.mp3"); File.WriteAllText(identityFile, "x");
+            var identities = new Dictionary<string, string>();
+            var onDisk = new RawTrack(new object(), "9", identityFile, "t", "a", 0, false, false, false, null, false);
+            var resolved = onDisk.Entry(identities).Song;
+            Check(resolved.Key == Song.StableKey("9", identityFile) && resolved.Key != resolved.LegacyKey && onDisk.Entry(identities).Song.Key == resolved.Key && identities.Count == 1,
+                "File identity keys match the stable key and are worked out once per file");
             main.Player.CurrentTrack = main.Library.Tracks[0];
             main.Player.UpNext.AddRange(main.Library.Tracks.Skip(1));
             Check(bridge.Snapshot("Current queue").Count == 3, "Queue source includes playing plus upcoming");
@@ -162,10 +179,10 @@ public sealed class OptionalAppend { public void AddRangeToQueue(IList<FakeTrack
 public sealed class IncompatibleAppend { public void AddRangeToQueue(IList<FakeTrack> tracks,string sourceName,bool announce){} }
 public sealed class FakeTrack
 {
-    public string Id { get; set; } = ""; public string FilePath => ""; public string Title => "Track " + Id;
-    public string Artist => "Artist"; public int PlayCount => 0; public bool SkipWhenShuffling => false;
+    public string Id { get; set; } = ""; public string FilePath { get; set; } = ""; public string Title => "Track " + Id;
+    public string Artist => "Artist"; public int PlayCount { get; set; } public bool SkipWhenShuffling => false;
     public bool IsExplicit => false; public bool IsDisliked => false; public DateTime? SnoozedUntil => null;
-    public bool IsRemoteStream => true;
+    public bool IsRemoteStream { get; set; } = true;
 }
 public sealed class FakeLibrary { public List<FakeTrack> Tracks { get; } = new() { new() { Id = "1" }, new() { Id = "2" }, new() { Id = "3" } }; }
 public sealed class FakeSettings { public bool AllowExplicitContent => true; }

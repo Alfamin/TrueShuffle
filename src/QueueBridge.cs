@@ -11,6 +11,28 @@ namespace TrueShuffle;
 public sealed record TrackEntry(object Native, Song Song);
 
 /// <summary>
+/// What a native track says about itself, read without touching its file. The file identity
+/// (<see cref="Song.StableKey"/>) opens the file, so <see cref="Entry"/> belongs on a worker thread
+/// whenever there are many tracks.
+/// </summary>
+public sealed record RawTrack(object Native, string Id, string Path, string Title, string Artist, int PlayCount,
+    bool Skip, bool Explicit, bool Disliked, DateTime? SnoozedUntil, bool Remote)
+{
+    /// <param name="identities">Optional: remembers keys already worked out, so a track met twice opens its file once.</param>
+    public TrackEntry Entry(Dictionary<string, string>? identities = null)
+    {
+        string? key = null;
+        var cacheKey = (Remote ? "r|" : "l|") + Id + "|" + Path;
+        if (identities == null || !identities.TryGetValue(cacheKey, out key))
+        {
+            key = Song.StableKey(Id, Path, Remote);
+            if (identities != null) identities[cacheKey] = key;
+        }
+        return new(Native, new Song(Id, Path, Title, Artist, PlayCount, Skip, Explicit, Disliked, SnoozedUntil, Remote, key));
+    }
+}
+
+/// <summary>
 /// Noctis kit 1.2 has no queue API. This narrow, validated adapter uses the desktop player's
 /// existing queue methods with its own Track objects; it never writes files or patches methods.
 /// If the contract changes, fail before a queue mutation instead of guessing.
@@ -57,10 +79,30 @@ public sealed class QueueBridge
     }
 
     public TrackEntry? Current => Get(Player, "CurrentTrack") is object t ? Wrap(t) : null;
+    /// <summary>The playing song without its file identity (nothing is opened).</summary>
+    public RawTrack? CurrentRaw => Get(Player, "CurrentTrack") is object t ? Read(t) : null;
+    /// <summary>The songs waiting in the native upcoming queue, in order; no file is opened.</summary>
+    public List<RawTrack> Upcoming() => ((IEnumerable)Get(Player, "UpNext")!).Cast<object>().Select(Read).ToList();
+
+    /// <summary>Adds songs behind what is already upcoming. Nothing is cleared, moved or restarted.</summary>
+    public void AppendUpcoming(IReadOnlyList<TrackEntry> entries)
+    {
+        if (entries.Count == 0) return;
+        var list = (IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(_trackType))!;
+        foreach (var entry in entries)
+        {
+            if (!_trackType.IsInstanceOfType(entry.Native)) throw Changed();
+            list.Add(entry.Native);
+        }
+        Append(list);
+    }
     public TrackEntry Entry(object native)=>Wrap(native);
     public bool ExplicitAllowed => Get(_main, "Settings") is object s ? (bool)(Get(s, "AllowExplicitContent") ?? throw Changed()) : throw Changed();
 
-    public List<TrackEntry> Snapshot(string scope)
+    public List<TrackEntry> Snapshot(string scope) => SnapshotRaw(scope).Select(raw => raw.Entry()).ToList();
+
+    /// <summary>The tracks of a source, read on the UI thread (the native collections may only be touched there); no file is opened.</summary>
+    public List<RawTrack> SnapshotRaw(string scope)
     {
         IEnumerable collection;
         if (scope == "Current queue")
@@ -78,7 +120,7 @@ public sealed class QueueBridge
         }
         else if (scope == "Whole library") collection = (IEnumerable)Get(_library, "Tracks")!;
         else throw new ArgumentException("Unknown scope");
-        return collection.Cast<object>().Select(Wrap).ToList();
+        return collection.Cast<object>().Select(Read).ToList();
     }
 
     public void Apply(IReadOnlyList<TrackEntry> ordered, bool keepCurrent)
@@ -127,14 +169,15 @@ public sealed class QueueBridge
     private void Append(IList tracks) => _add.Invoke(Player, _add.GetParameters().Length == 1
         ? new object?[] { tracks } : new object?[] { tracks, null, false });
 
-    private TrackEntry Wrap(object t)
+    private TrackEntry Wrap(object t) => Read(t).Entry();
+
+    private RawTrack Read(object t)
     {
         if (!_trackType.IsInstanceOfType(t)) throw Changed();
-        return new(t, new Song(Get(t, "Id")!.ToString()!, (string)Get(t, "FilePath")!,
+        return new(t, Get(t, "Id")!.ToString()!, (string)Get(t, "FilePath")!,
             (string)Get(t, "Title")!, (string)Get(t, "Artist")!, (int)Get(t, "PlayCount")!,
             (bool)Get(t, "SkipWhenShuffling")!, (bool)Get(t, "IsExplicit")!, (bool)Get(t, "IsDisliked")!,
-            (DateTime?)Get(t, "SnoozedUntil"), (bool)Get(t, "IsRemoteStream")!,
-            Song.StableKey(Get(t, "Id")!.ToString()!, (string)Get(t, "FilePath")!, (bool)Get(t, "IsRemoteStream")!)));
+            (DateTime?)Get(t, "SnoozedUntil"), (bool)Get(t, "IsRemoteStream")!);
     }
     internal static PropertyInfo? Property(object o, string p) => o.GetType().GetProperty(p, BindingFlags.Instance | BindingFlags.Public);
     internal static object? Get(object o, string p) => Property(o, p)?.GetValue(o);

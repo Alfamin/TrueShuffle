@@ -17,11 +17,14 @@ public sealed class QueueFrontPolicy : IDisposable
     private readonly MethodInfo _move, _remove;
     private readonly Action<IReadOnlyList<object>> _admit;
     private readonly Action<string> _error;
+    private readonly Action? _replaced;
     private object[] _before;
     private readonly List<object> _pending = new();
     private bool _posted, _editing, _disposed;
-    public QueueFrontPolicy(object player, Action<IReadOnlyList<object>> admit, Action<string> error)
+    /// <param name="replaced">Called (later, on the UI thread) when the user cleared the upcoming queue or replaced it with other songs.</param>
+    public QueueFrontPolicy(object player, Action<IReadOnlyList<object>> admit, Action<string> error, Action? replaced = null)
     {
+        _replaced=replaced;
         _player=player;
         _queue=QueueBridge.Get(player,"UpNext") as IEnumerable ?? throw new NotSupportedException("Upcoming queue is unavailable.");
         _events=_queue as INotifyCollectionChanged ?? throw new NotSupportedException("Upcoming queue has no change notifications.");
@@ -51,7 +54,19 @@ public sealed class QueueFrontPolicy : IDisposable
                     Dispatcher.UIThread.Post(Promote,DispatcherPriority.Input);
                 }
             }
-            else _pending.Clear(); // later user edits/removals win; never resurrect a removed row
+            else
+            {
+                _pending.Clear(); // later user edits/removals win; never resurrect a removed row
+                // The real player announces a cleared queue, a replaced queue and a bulk addition alike
+                // as Reset; an addition keeps the old rows as its prefix (handled above). A Reset that
+                // leaves nothing, or brings songs that were not upcoming, is the user starting over.
+                if (e.Action==NotifyCollectionChangedAction.Reset && _replaced!=null && _before.Length>0)
+                {
+                    var known=new HashSet<object>(_before,ReferenceEqualityComparer.Instance);
+                    if (after.Length==0 || after.Any(track=>!known.Contains(track)))
+                        Dispatcher.UIThread.Post(()=>{ if (!_disposed) _replaced(); },DispatcherPriority.Input);
+                }
+            }
         }
         _before=after;
         }
@@ -99,6 +114,13 @@ public sealed class QueueFrontPolicy : IDisposable
         }
         catch(Exception ex) { _error("Could not put requested songs next: "+ex.GetBaseException().Message+". Check the queue; playback was not restarted."); }
         finally { _editing=false;_before=Snapshot(); }
+    }
+    /// <summary>Runs a queue change of the plugin's own (a rolling queue adding more songs) that must not be taken for a request to play something next.</summary>
+    public void Own(Action change)
+    {
+        var was=_editing; _editing=true;
+        try { change(); }
+        finally { _editing=was; _before=Snapshot(); }
     }
     public void Dispose()
     {

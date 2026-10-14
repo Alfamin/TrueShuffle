@@ -1,5 +1,18 @@
 # True Shuffle for Noctis
 
+Version 1.2.0 keeps the music going. Apply queues the first 200 songs of the plan and adds the next
+200 whenever the upcoming queue is down to 20, so a cycle never ends with silence: the next cycle (or
+a fresh order, or the play counts again) follows, with the same mode and source. Only Never played
+only ends, with one notice, when none are left. Noctis is also given a queue of 200 instead of a
+whole library to show and edit, which keeps the first click on a mode light.
+
+Version 1.1.3 keeps the interface smooth and the history safe. Applying a shuffle no longer opens
+every song file on the UI thread (file identities are worked out in the background), the search for
+the shuffle buttons backs off to every five seconds once they are attached (a newly opened window
+such as the mini player is still found at once), a progress save that fails is retried with the next
+song instead of stopping saving for the session (and cycle.json is replaced with a short retry when
+another program holds it), and disabling the plugin waits up to two seconds for the last save.
+
 Version 1.1.2 makes the Shuffle key open the same mode menu as the button. It follows Noctis's
 live shortcut binding (Ctrl+S by default); set the plugin's Shuffle shortcut to `off` for native
 keyboard shuffle. Shortcut recording, editing windows and plugin shutdown release the keys.
@@ -55,7 +68,7 @@ is refused rather than replaced with a broader source. Missing local files are e
 | Equal chance | Uniform Fisher–Yates permutation; every eligible song once | A later shuffle can revisit a song |
 | No repeats | Uniform among songs not started in the remembered cycle | Excludes previous starts until that source is exhausted |
 | Discovery | Lowest Noctis play counts first; random order within ties | Uses the same remembered no-repeat cycle |
-| Never played only | Only Noctis play count zero, and not started in a True Shuffle session | Stops when none remain; never falls back to familiar songs |
+| Never played only | Only Noctis play count zero, and not started in a True Shuffle session | Plays out the queue and stops when none remain; never falls back to familiar songs |
 
 Skip-when-shuffling, active snoozes and Noctis's explicit-content setting are respected. Disliked songs
 have the same chance by default; **Exclude songs marked as disliked** is an optional explicit filter.
@@ -76,7 +89,18 @@ Favorites and star ratings do not affect any mode.
   It affects plugin progress, not Noctis's play counts or listening history.
 - A custom queue suspends similar-song **Autoplay** and **Repeat** and turns the built-in weighted
   Shuffle off. Starting it ends **Track Radio**. Closing the control window keeps the custom session
-  active. The finite queue stops when it runs out; it does not refill automatically.
+  active.
+- **The queue keeps going.** Apply puts only the first 200 songs of the plan into Noctis's queue; the
+  rest of the plan waits in memory, in order. When the upcoming queue is down to 20 songs, the next 200
+  are added behind it. Adding never restarts or reorders anything: the playing song, the order of the
+  queue and songs you put next with **Add to Queue** are left alone, and a song counts as heard when it
+  starts, not when it is added. Songs that left the library, are already upcoming, were heard or
+  played for the first time meanwhile, or are no longer allowed by the mode are skipped. When the plan
+  is used up the next one is made with the same mode and source: a fresh cycle for No repeats (without
+  what is still upcoming), a new random order for Equal chance, the play counts again for Discovery.
+  Never played only stops when none are left, with one notice, and plays out what is queued. A source
+  of a few songs simply goes round again. Clearing the upcoming queue in Noctis, or replacing it by
+  playing something else, ends the session (and the continuation), like the controls below.
 - **Return to Noctis controls**, changing native shuffle/repeat/radio/autoplay controls, or disabling
   the plugin ends the session. Prior Autoplay and Repeat values are restored unless you changed them.
   The arranged queue is kept, built-in Shuffle stays off unless you turn it on, and the old radio seed
@@ -132,7 +156,7 @@ runtime and cached Avalonia.Headless 12.1.3. It downloads nothing. Paths can be 
 
     & .\build.ps1
 
-The default build runs **84 assertions** before creating the plugin ZIP, covering uniform permutations,
+The default build runs **158 assertions** before creating the plugin ZIP, covering uniform permutations,
 2000-track membership, cycle restart/persistence, eligibility and discovery ordering, failed-append
 recovery, cancellation, lifecycle and preference restoration. Headless UI tests exercise the actual
 window and plugin entry point with a fake host. Native integration uses the installed Noctis

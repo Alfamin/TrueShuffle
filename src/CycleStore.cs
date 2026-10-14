@@ -60,7 +60,7 @@ public sealed class CycleStore
                 await f.WriteAsync(bytes);
                 f.Flush(true);
             }
-            File.Move(temp, _path, overwrite: true);
+            await PublishAsync(temp);
         }
         finally
         {
@@ -68,6 +68,22 @@ public sealed class CycleStore
             _gate.Release();
         }
     }
+
+    /// <summary>
+    /// Replaces cycle.json with the staged file. A virus scanner, the search indexer or a backup tool
+    /// may hold the old file for a moment; that is waited out briefly instead of losing the save.
+    /// </summary>
+    private async Task PublishAsync(string temp)
+    {
+        for (int attempt = 1; ; attempt++)
+        {
+            try { File.Move(temp, _path, overwrite: true); return; }
+            catch (Exception ex) when (attempt < MoveAttempts && (ex is IOException or UnauthorizedAccessException))
+            { await Task.Delay(50 * attempt); }
+        }
+    }
+
+    private const int MoveAttempts = 5;
 
     private static bool ValidKey(string k) => k != null && k.Length == 64 && k.All(c => char.IsAsciiHexDigit(c));
 }

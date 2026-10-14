@@ -79,6 +79,73 @@ internal static class NativePlayerTests
                 var item=Activator.CreateInstance(trackType)!;Set(item,"Id",Guid.NewGuid());Set(item,"Title","Prepared "+i);
                 Set(item,"FilePath",Path.Combine(Path.GetTempPath(),"prepared-shuffle-"+i+".flac"));big.Add(item);
             }
+            { // Rolling queue against the real player: its own additions are left where they are, and a cleared or replaced queue is noticed.
+                var listOf=typeof(IList<>).MakeGenericType(trackType);
+                IList Some(int from,int count){ var l=(IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(trackType))!; for(int i=from;i<from+count;i++)l.Add(big[i]!); return l; }
+                object[] Upcoming()=>((IEnumerable)Get(player,"UpNext")!).Cast<object>().ToArray();
+                var replace=playerType.GetMethod("ReplaceQueueAndPlay",new[]{listOf,typeof(int)})!;
+                var addMany=QueueBridge.FindAppend(playerType,listOf)!;
+                int replaced=0;
+                replace.Invoke(player,new object[]{Some(0,5),0});Dispatcher.UIThread.RunJobs();
+                using(var policy=new QueueFrontPolicy(player,_=>{},message=>throw new Exception(message),()=>replaced++))
+                {
+                    var window=Some(10,5);
+                    policy.Own(()=>addMany.Invoke(player,new object?[]{window,null,false}));Dispatcher.UIThread.RunJobs();
+                    var queue=Upcoming();
+                    check(queue.Length==9 && ReferenceEquals(queue[0],big[1]) && ReferenceEquals(queue[4],big[10]) && ReferenceEquals(queue[8],big[14]),"A rolling addition stays behind the upcoming songs instead of being promoted to the front");
+                    addMany.Invoke(player,new object?[]{Some(20,2),null,false});Dispatcher.UIThread.RunJobs();
+                    queue=Upcoming();
+                    check(ReferenceEquals(queue[0],big[20]) && ReferenceEquals(queue[1],big[21]) && ReferenceEquals(queue[2],big[1]),"The user's own addition still goes next");
+                    ((ICommand)Get(player,"NextCommand")!).Execute(null);Dispatcher.UIThread.RunJobs();
+                    playerType.GetMethod("RemoveFromQueue",new[]{typeof(int)})!.Invoke(player,new object[]{0});Dispatcher.UIThread.RunJobs();
+                    playerType.GetMethod("AddToQueue")!.Invoke(player,new object[]{big[30]!,false});Dispatcher.UIThread.RunJobs();
+                    check(replaced==0,"Playing on, removing a song and adding a song do not end a session");
+                    playerType.GetMethod("ClearQueue")!.Invoke(player,null);Dispatcher.UIThread.RunJobs();
+                    check(replaced==1,"Clearing the upcoming queue is reported");
+                }
+                replace.Invoke(player,new object[]{Some(0,5),0});Dispatcher.UIThread.RunJobs();
+                using(var policy=new QueueFrontPolicy(player,_=>{},message=>throw new Exception(message),()=>replaced++))
+                {
+                    replace.Invoke(player,new object[]{Some(40,5),0});Dispatcher.UIThread.RunJobs();
+                    check(replaced==2,"Replacing the queue with other songs is reported");
+                }
+            }
+            // What the real Track and PlayerViewModel cost on the UI thread for a library of this size (printed, not asserted).
+            library.Values["get_Tracks"]=big;
+            for(int run=0;run<2;run++)
+            {
+                long begun=System.Diagnostics.Stopwatch.GetTimestamp();
+                var read=bridge.SnapshotRaw("Whole library");
+                Console.WriteLine($"UI-THREAD native snapshot of {read.Count:N0} real Track objects: {System.Diagnostics.Stopwatch.GetElapsedTime(begun).TotalMilliseconds:0.0} ms");
+            }
+            var append=QueueBridge.FindAppend(playerType,typeof(IList<>).MakeGenericType(trackType))!;
+            var clock=System.Diagnostics.Stopwatch.StartNew();
+            foreach(int size in new[]{2000,200,2000,200})
+            {
+                var part=(IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(trackType))!;
+                for(int i=0;i<size;i++)part.Add(big[i]!);
+                clock.Restart();
+                playerType.GetMethod("ClearQueue")!.Invoke(player,null);
+                append.Invoke(player,new object?[]{part,null,false});
+                Console.WriteLine($"UI-THREAD native ClearQueue + AddRangeToQueue({size:N0} tracks): {clock.Elapsed.TotalMilliseconds:0.0} ms");
+                Dispatcher.UIThread.RunJobs();
+            }
+            playerType.GetMethod("ClearQueue")!.Invoke(player,null);
+            QueueBridge.FindAppend(playerType,typeof(IList<>).MakeGenericType(trackType))!.Invoke(player,new object?[]{big,null,false});Dispatcher.UIThread.RunJobs();
+            // The whole native part of an Apply with the weighted shuffle ON, as a user who clicks the button would have it.
+            var toggle=(ICommand)Get(player,"ToggleShuffleCommand")!;
+            clock.Restart();
+            if(!(bool)Get(player,"IsShuffleEnabled")!)toggle.Execute(null);
+            Console.WriteLine($"UI-THREAD native shuffle switched on with a 2,000-song queue (set-up, not part of Apply): {clock.Elapsed.TotalMilliseconds:0.0} ms");
+            foreach(int size in new[]{2000,200})
+            {
+                var wanted=big.Cast<object>().Take(size).Select(t=>new TrackEntry(t,new Song("x","","","",0,false,false,false,null,true))).ToList();
+                if(!(bool)Get(player,"IsShuffleEnabled")!)toggle.Execute(null);
+                clock.Restart();
+                using(new PlaybackLease(player)){ var lease=clock.Elapsed.TotalMilliseconds; bridge.Apply(wanted,true);
+                    Console.WriteLine($"UI-THREAD native Apply path with shuffle on, {size:N0} songs: lease {lease:0.0} ms, lease + shuffle off + clear + append {clock.Elapsed.TotalMilliseconds:0.0} ms"); }
+                Dispatcher.UIThread.RunJobs();
+            }
             playerType.GetMethod("ClearQueue")!.Invoke(player,null);
             QueueBridge.FindAppend(playerType,typeof(IList<>).MakeGenericType(trackType))!.Invoke(player,new object?[]{big,null,false});Dispatcher.UIThread.RunJobs();
             var playing=Get(player,"CurrentTrack");int played=audio.Calls.Count(c=>c=="Play");

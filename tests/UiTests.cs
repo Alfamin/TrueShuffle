@@ -69,6 +69,8 @@ internal static class UiTests
 
         PluginLifecycle(check);
         ShuffleButton(check);
+        UiThreadTests.Run(check);
+        RollingTests.Run(check);
     }
 
     private static void ShuffleButton(Action<bool, string> check)
@@ -87,6 +89,15 @@ internal static class UiTests
             () => command.Execute(null), () => opens++, _ => { });
         menu.Refresh(new[] { root }); menu.Refresh(new[] { root });
         check(native.ContextMenu != original && other.ContextMenu == null && nativeToggles == 0, "Only shuffle-bound buttons gain a menu; attach never toggles playback");
+        int tipSets = 0;
+        native.PropertyChanged += (_, e) => { if (e.Property == ToolTip.TipProperty) tipSets++; };
+        menu.Refresh(new[] { root }); menu.Refresh(new[] { root });
+        check(tipSets == 0 && menu.Count == 1, "A scan does not set an unchanged tooltip again");
+        var mini = new Window();
+        check(ShuffleButtonMenu.Fingerprint(new[] { root }) == ShuffleButtonMenu.Fingerprint(new[] { root }) && ShuffleButtonMenu.Fingerprint(new[] { root }) != ShuffleButtonMenu.Fingerprint(new[] { root, mini }),
+            "A window that came or went changes the fingerprint that triggers a scan");
+        check(ShuffleButtonMenu.ScanInterval(1, TimeSpan.Zero) == TimeSpan.FromSeconds(5) && ShuffleButtonMenu.ScanInterval(0, TimeSpan.FromSeconds(5)) == TimeSpan.FromSeconds(1)
+            && ShuffleButtonMenu.ScanInterval(0, TimeSpan.FromSeconds(31)) == TimeSpan.FromSeconds(5), "Scans back off once the buttons are attached, and later when there are none");
         native.Activate(); Dispatcher.UIThread.RunJobs();
         check(native.ContextMenu!.IsOpen && nativeToggles == 0, "Actual Button.OnClick opens choices without also running weighted shuffle");
         var noRepeats = native.ContextMenu.Items.OfType<MenuItem>().Single(i => Equals(i.Header, "No repeats"));
@@ -118,7 +129,7 @@ internal static class UiTests
     {
         string temp = Path.Combine(Path.GetTempPath(), "shuffle-ui-" + Guid.NewGuid().ToString("N"));
         var host = new UiHost(temp);
-        var plugin = new TrueShufflePlugin(); plugin.Initialize(host);
+        var plugin = new TrueShufflePlugin(); plugin.Initialize(host); Set(plugin, "_refillAt", -1);
         Pump(() => ((Task)Field(plugin, "_load")).IsCompleted);
         check(host.Commands == 1 && !File.Exists(Path.Combine(temp, "cycle.json")), "Plugin enable registers controls without writing a queue/history");
         var main = new FakeMain(); main.Player.IsShuffleEnabled = false;
@@ -158,7 +169,7 @@ internal static class UiTests
         second.Shutdown();
 
         // A return-to-normal action while an asynchronous preparation is pending cancels it.
-        var canceled = new TrueShufflePlugin(); canceled.Initialize(new UiHost(Path.Combine(temp, "cancel")));
+        var canceled = new TrueShufflePlugin(); canceled.Initialize(new UiHost(Path.Combine(temp, "cancel"))); Set(canceled, "_refillAt", -1);
         Pump(() => ((Task)Field(canceled, "_load")).IsCompleted);
         var large = new FakeMain(); large.Library.Tracks.Clear();
         large.Library.Tracks.AddRange(Enumerable.Range(0, 5000).Select(i => new FakeTrack { Id = i.ToString() }));
@@ -174,7 +185,7 @@ internal static class UiTests
             "Cancel during asynchronous preparation does not later replace the queue");
         canceled.Shutdown();
 
-        var quick = new TrueShufflePlugin(); quick.Initialize(new UiHost(Path.Combine(temp, "quick")));
+        var quick = new TrueShufflePlugin(); quick.Initialize(new UiHost(Path.Combine(temp, "quick"))); Set(quick, "_refillAt", -1);
         Pump(() => ((Task)Field(quick, "_load")).IsCompleted);
         var quickMain = new FakeMain(); quickMain.Player.CurrentTrack = quickMain.Library.Tracks[0];
         Set(quick, "_bridge", new QueueBridge(quickMain, false));
@@ -184,6 +195,60 @@ internal static class UiTests
         check(quickMain.Player.UpNext.Count == 2 && FieldNullable(quick, "_window") == null && FieldNullable(quick, "_lease") != null,
             "Quick shuffle applies with no settings/control window open");
         quick.Shutdown();
+
+        // Songs with real files: the keys that reach the session are the file-identity ones, worked out in the background.
+        var files = Path.Combine(temp, "files"); Directory.CreateDirectory(files);
+        var onDisk = new FakeMain(); onDisk.Library.Tracks.Clear();
+        onDisk.Library.Tracks.AddRange(Enumerable.Range(1, 4).Select(i =>
+        {
+            var file = Path.Combine(files, "song " + i + ".mp3"); File.WriteAllText(file, "synthetic audio");
+            return new FakeTrack { Id = i.ToString(), FilePath = file, IsRemoteStream = false };
+        }));
+        onDisk.Player.CurrentTrack = onDisk.Library.Tracks[0];
+        var local = new TrueShufflePlugin(); local.Initialize(new UiHost(Path.Combine(temp, "local"))); Set(local, "_refillAt", -1);
+        Pump(() => ((Task)Field(local, "_load")).IsCompleted);
+        Set(local, "_bridge", new QueueBridge(onDisk, false));
+        var localApply = (Task)typeof(TrueShufflePlugin).GetMethod("ApplyAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .Invoke(local, new object[] { ShuffleMode.NoRepeats, "Whole library", true, false })!;
+        Pump(() => localApply.IsCompleted);
+        var sessionKeys = (HashSet<string>)Field(local, "_session");
+        var queued = onDisk.Player.UpNext.Select(t => (t.Id, t.FilePath)).ToArray();
+        check(queued.Length == 3 && queued.All(q => sessionKeys.Contains(Song.StableKey(q.Id, q.FilePath)) && Song.StableKey(q.Id, q.FilePath) != new Song(q.Id, q.FilePath, "", "", 0, false, false, false, null).LegacyKey
+                && sessionKeys.Contains(new Song(q.Id, q.FilePath, "", "", 0, false, false, false, null).LegacyKey)),
+            "Apply on real files queues every other song and keys the session by file identity and path");
+        local.Shutdown();
+
+        // A save that fails does not stop saving: the next one that can be written holds everything.
+        var failingHost = new UiHost(Path.Combine(temp, "failing")); var failing = new TrueShufflePlugin(); failing.Initialize(failingHost); Set(failing, "_refillAt", -1); // these tests look at the first plan and at saving, not at what follows
+        Pump(() => ((Task)Field(failing, "_load")).IsCompleted);
+        var six = new FakeMain(); six.Player.IsShuffleEnabled = false; six.Library.Tracks.Clear();
+        six.Library.Tracks.AddRange(Enumerable.Range(1, 6).Select(i => new FakeTrack { Id = i.ToString() }));
+        six.Player.CurrentTrack = six.Library.Tracks[0]; six.Player.UpNext.AddRange(six.Library.Tracks.Skip(1));
+        Set(failing, "_bridge", new QueueBridge(six, false));
+        var sixApply = (Task)typeof(TrueShufflePlugin).GetMethod("ApplyAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .Invoke(failing, new object[] { ShuffleMode.NoRepeats, "Whole library", true, false })!;
+        Pump(() => sixApply.IsCompleted); Pump(() => ((Task)Field(failing, "_save")).IsCompleted);
+        var history = Path.Combine(temp, "failing", "cycle.json");
+        check(File.Exists(history) && failingHost.Notices.Count(n => n.Contains("could not be saved")) == 0, "Applying writes the history");
+        void Next() { six.Player.CurrentTrack = six.Player.UpNext[0]; six.Player.UpNext.RemoveAt(0); failingHost.Playing.Fire(); }
+        void Settle() { Pump(() => ((Task)Field(failing, "_save")).IsCompleted); }
+        var held = new FileStream(history, FileMode.Open, FileAccess.Read, FileShare.None); // another program holds cycle.json
+        Next(); Settle(); Next(); Settle();
+        check(failingHost.Notices.Count(n => n.Contains("could not be saved")) == 1, "A failing save is announced once for the whole streak");
+        check(((HashSet<string>)Field(failing, "_seen")).Count == 3 && FieldNullable(failing, "_historyError") == null, "Progress is kept in memory and history stays usable while saving fails");
+        held.Dispose();
+        Next(); Settle();
+        var healed = new CycleStore(Path.Combine(temp, "failing")).LoadAsync(); Pump(() => healed.IsCompleted);
+        check(healed.Result.Seen.Length == 4, "The next save that works holds the songs met while saving failed");
+        held = new FileStream(history, FileMode.Open, FileAccess.Read, FileShare.None);
+        Next(); Settle();
+        check(failingHost.Notices.Count(n => n.Contains("could not be saved")) == 2, "A new failure streak is announced again");
+        held.Dispose();
+        Next();
+        failing.Shutdown(); // no waiting for the save here: Shutdown itself waits for it
+        check(((Task)Field(failing, "_save")).IsCompleted, "Disabling waits for the pending history save");
+        var last = new CycleStore(Path.Combine(temp, "failing")).LoadAsync(); Pump(() => last.IsCompleted);
+        check(last.Result.Seen.Length == 6, "The song that started last is in the saved history");
     }
 
     private static object Field(object o, string name) => FieldNullable(o, name)!;
@@ -232,7 +297,8 @@ internal sealed class UiHost : IPluginHost
     public IPluginSettings Settings => SettingsSource; public INowPlaying NowPlaying => Playing;
     public IBeatSource Beat => throw new NotSupportedException(); public ISpectrumSource Spectrum => throw new NotSupportedException();
     public int Commands { get; private set; } public int Disposals { get; private set; }
-    public void Log(string message) { } public void Notify(string message) { }
+    public List<string> Notices { get; } = new();
+    public void Log(string message) { } public void Notify(string message) => Notices.Add(message);
     public void RegisterVisualLayer(IVisualLayerProvider provider) => throw new NotSupportedException();
     public IDisposable RegisterTrackCommand(string label, string? icon, Action<TrackInfo> handler) { Commands++; return new DisposeAction(() => Disposals++); }
     private sealed class DisposeAction : IDisposable { private readonly Action _action; public DisposeAction(Action a) => _action = a; public void Dispose() => _action(); }

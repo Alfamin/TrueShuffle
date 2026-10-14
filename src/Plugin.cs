@@ -15,7 +15,7 @@ namespace TrueShuffle;
 
 public sealed class TrueShufflePlugin : INoctisPlugin
 {
-    public PluginInfo Info { get; } = new("dev.moshi.trueshuffle", "True Shuffle", "1.1.2", "moshi",
+    public PluginInfo Info { get; } = new("dev.moshi.trueshuffle", "True Shuffle", "1.2.0", "moshi",
         "Equal-chance shuffle, persistent no-repeat cycles, and discovery modes for your queue, playlist or library.");
     private IPluginHost? _host;
     private IDisposable? _command;
@@ -32,15 +32,23 @@ public sealed class TrueShufflePlugin : INoctisPlugin
     private HashSet<string> _session = new(StringComparer.Ordinal);
     private string? _last, _lastPath, _historyError;
     private bool _closed, _busy, _ownChange;
-    private int _epoch, _pending;
+    private volatile bool _saveFailing; // the last attempt to save progress failed (history that could not be LOADED is _historyError)
+    private int _epoch, _pending, _historyVersion; // _historyVersion changes whenever the remembered history is replaced or reset
     private string? _buttonError;
+    private DateTime _buttonsScanned = DateTime.MinValue, _buttonsSince = DateTime.UtcNow;
+    private int _windowsSeen;
+    // A custom session puts only a window of its plan into Noctis's queue, and adds the next window
+    // when the queue is down to _refillAt songs (the tests use small numbers).
+    private RollingQueue? _roll;
+    private Task _refill = Task.CompletedTask;
+    private int _windowSize = 200, _refillAt = 20;
 
     public void Initialize(IPluginHost host)
     {
         _host = host;
         _closed = false;
         _busy = false;
-        _seen = new(StringComparer.Ordinal); _last = null; _lastPath = null; _historyError = null;
+        _seen = new(StringComparer.Ordinal); _last = null; _lastPath = null; _historyError = null; _saveFailing = false;
         int epoch = ++_epoch;
         _store = new CycleStore(host.DataDirectory);
         _load = LoadAsync(_store, epoch);
@@ -56,6 +64,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
                 RefreshButtons(null,EventArgs.Empty);
                 if (_buttons?.Open(window) != true) Open();
             }, Notice);
+        _buttonsScanned = DateTime.MinValue; _buttonsSince = DateTime.UtcNow; _windowsSeen = 0;
         _buttonTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
         _buttonTimer.Tick += RefreshButtons; _buttonTimer.Start();
         host.Log("ready; playback remains unchanged until Apply shuffle is clicked");
@@ -116,6 +125,12 @@ public sealed class TrueShufflePlugin : INoctisPlugin
                 (mode, scope) => ApplyAsync(mode, scope, true, _host.Settings.GetBool("skipDisliked", false)),
                 () => { EndSession(); ((ICommand)QueueBridge.Get(_bridge!.Player, "ToggleShuffleCommand")!).Execute(null); },
                 Open, Notice);
+            // Finding the buttons walks the visual tree of every window, so a tick does that only when a
+            // window came or went (the mini player) or when the pause is over; the shortcut always looks.
+            var now = DateTime.UtcNow;
+            var windows = ShuffleButtonMenu.Fingerprint(desktop.Windows);
+            if (sender != null && windows == _windowsSeen && now - _buttonsScanned < ShuffleButtonMenu.ScanInterval(_buttons.Count, now - _buttonsSince)) return;
+            _windowsSeen = windows; _buttonsScanned = now;
             _buttons.Refresh(desktop.Windows);
             _buttonError = null;
         }
@@ -149,47 +164,63 @@ public sealed class TrueShufflePlugin : INoctisPlugin
         try
         {
             await _load;
+            await _refill; // a plan the old session is still making is finished first, so the two never meet
             if (_closed || epoch != _epoch || operation != _pending || !ReferenceEquals(window, _window)) return;
             if (_historyError != null && mode != ShuffleMode.EqualChance)
                 throw new IOException("Remembered progress is unavailable. Use Equal chance, or inspect the plugin's cycle.json before continuing.");
             var bridge = _bridge;
-            var entries = bridge.Snapshot(scope);
-            var upgraded = ShuffleEngine.UpgradeHistory(bridge.Snapshot("Whole library").Select(e=>e.Song),_seen,_last,_lastPath);
-            _seen = new(upgraded.Seen,StringComparer.Ordinal); _last=upgraded.Last;
+            // The native collections may only be read here, on the UI thread, and that is cheap. What
+            // costs is each song's file identity (it opens the file): that, the history upgrade, the
+            // shuffle and the session keys are all worked out on a thread of our own.
+            var raw = bridge.SnapshotRaw(scope);
+            var libraryRaw = scope == "Whole library" ? raw : bridge.SnapshotRaw("Whole library");
             var current = bridge.Current?.Song;
             string? currentKey = keepCurrent ? current?.Key : null;
             bool explicitAllowed = bridge.ExplicitAllowed;
-            var remembered = current != null ? _seen.Append(current.Key).ToArray() : _seen.ToArray();
-            var last = _last;
+            var known = _seen.ToArray(); var knownLast = _last; var knownLastPath = _lastPath;
             if (_window != null) _window.Status = "Preparing the queue…";
-            var plan = await Task.Run(() => ShuffleEngine.Build(entries.Select(e => e.Song)
-                .Where(s => s.Remote || (!string.IsNullOrWhiteSpace(s.Path) && File.Exists(s.Path))),
-                mode, remembered, currentKey, last, explicitAllowed, skipDisliked));
+            var prepared = await Task.Run(() =>
+            {
+                var identities = new Dictionary<string, string>(StringComparer.Ordinal);
+                var entries = raw.Select(r => r.Entry(identities)).ToList();
+                var library = ReferenceEquals(libraryRaw, raw) ? entries : libraryRaw.Select(r => r.Entry(identities)).ToList();
+                var history = ShuffleEngine.UpgradeHistory(library.Select(e => e.Song), known, knownLast, knownLastPath);
+                var remembered = current != null ? history.Seen.Append(current.Key).ToArray() : history.Seen;
+                var built = ShuffleEngine.Build(entries.Select(e => e.Song)
+                    .Where(s => s.Remote || (!string.IsNullOrWhiteSpace(s.Path) && File.Exists(s.Path))),
+                    mode, remembered, currentKey, history.Last, explicitAllowed, skipDisliked);
+                var native = entries.DistinctBy(e => e.Song.Key).ToDictionary(e => e.Song.Key);
+                var queue = built.Songs.Select(s => native[s.Key]).ToList();
+                var keys = queue.SelectMany(e => new[] { e.Song.Key, e.Song.LegacyKey }).ToHashSet(StringComparer.Ordinal);
+                return (history, plan: built, ordered: queue, session: keys, identities);
+            });
             if (_closed || epoch != _epoch || operation != _pending || !ReferenceEquals(window, _window)) return;
+            var upgraded = prepared.history; var plan = prepared.plan; var ordered = prepared.ordered;
+            _seen = new(upgraded.Seen,StringComparer.Ordinal); _last=upgraded.Last; _historyVersion++;
             if (keepCurrent && bridge.Current?.Song.Key != currentKey)
                 throw new InvalidOperationException("The playing song changed while preparing. Apply again to keep the new song.");
-            if (bridge.ExplicitAllowed != explicitAllowed || !entries.Select(e => e.Song).SequenceEqual(bridge.Snapshot(scope).Select(e => e.Song)))
+            if (bridge.ExplicitAllowed != explicitAllowed || !raw.SequenceEqual(bridge.SnapshotRaw(scope)))
                 throw new InvalidOperationException("The source or playback policy changed while preparing. Apply again to use the updated selection.");
             if (plan.Songs.Count == 0)
             {
                 Status(mode == ShuffleMode.NeverPlayed ? "No eligible never-played songs remain in this source. Try Discovery or another source." : "No eligible upcoming songs in this source. Nothing was changed.");
                 return;
             }
-            var native = entries.DistinctBy(e => e.Song.Key).ToDictionary(e => e.Song.Key);
-            var ordered = plan.Songs.Select(s => native[s.Key]).ToList();
             var previousSeen = new HashSet<string>(_seen, StringComparer.Ordinal);
             var previousLast = _last;
             var previousLastPath = _lastPath;
+            // Only a window of the plan goes into Noctis's queue; the rest waits in _roll.
+            var first = ordered.Count > _windowSize ? ordered.GetRange(0, _windowSize) : ordered;
             EndSession(cancelPending: false);
             _ownChange = true;
             try
             {
                 _lease = new PlaybackLease(bridge.Player);
-                _session = ordered.SelectMany(e => new[]{e.Song.Key,e.Song.LegacyKey}).ToHashSet(StringComparer.Ordinal);
+                _session = prepared.session;
                 if (currentKey != null) { _session.Add(currentKey); _session.Add(current!.LegacyKey); }
                 _seen = new(plan.Seen, StringComparer.Ordinal);
                 if (bridge.Player is INotifyPropertyChanged events) events.PropertyChanged += PlayerChanged;
-                bridge.Apply(ordered, keepCurrent);
+                bridge.Apply(first, keepCurrent);
                 if (QueueBridge.Get(bridge.Player,"UpNext") is System.Collections.Specialized.INotifyCollectionChanged)
                     _priority=new QueueFrontPolicy(bridge.Player, requested=>
                     {
@@ -199,18 +230,154 @@ public sealed class TrueShufflePlugin : INoctisPlugin
                             _session.Add(song.Key);_session.Add(song.LegacyKey);
                         }
                         Notice($"{requested.Count} song{(requested.Count==1 ? "" : "s")} added next, ahead of the shuffle.");
-                    },Notice);
+                    },Notice,OnQueueReplaced);
+                _roll = new RollingQueue(mode, scope, skipDisliked, scope == "Whole library" ? null : raw, ordered, first.Count, prepared.identities);
             }
             catch { _seen = previousSeen; _last = previousLast; _lastPath = previousLastPath; EndSession(); throw; }
             finally { _ownChange = false; }
             MarkCurrent(persist: false);
             QueueSave();
             _buttons?.Selected(mode, scope);
-            Status($"{plan.Songs.Count:N0} upcoming songs queued. " + (plan.NewCycle ? "A fresh cycle started because this source was exhausted. " : "") +
+            Status($"{first.Count:N0} upcoming songs queued; more are added as you listen" + (mode == ShuffleMode.NeverPlayed ? " until no never-played song is left. " : ". ") +
+                (plan.NewCycle ? "A fresh cycle started because this source was exhausted. " : "") +
                 "Repeat and similar-song Autoplay are suspended for this session; Track Radio ended.");
+            WatchQueue();
         }
         catch (Exception ex) { if (!_closed && epoch == _epoch && ReferenceEquals(window, _window)) Status(ex.GetBaseException().Message); }
         finally { if (epoch == _epoch) { _busy = false; if (_window != null) _window.Busy = false; } }
+    }
+
+    // ── the rolling queue: more songs are added as the upcoming queue runs low ──
+
+    private bool Active(RollingQueue roll, int epoch)
+        => !_closed && epoch == _epoch && ReferenceEquals(_roll, roll) && _lease != null && _bridge != null;
+
+    /// <summary>Looks at the queue once the player has finished with the song change that caused it.</summary>
+    private void WatchQueue()
+    {
+        var roll = _roll;
+        if (roll == null || roll.Busy || roll.Finished) return;
+        Dispatcher.UIThread.Post(() => { if (ReferenceEquals(_roll, roll) && !roll.Busy) _refill = ContinueAsync(roll); }, DispatcherPriority.Background);
+    }
+
+    private async Task ContinueAsync(RollingQueue roll)
+    {
+        if (roll.Busy || roll.Finished || _busy || DateTime.UtcNow < roll.NotBefore) return; // while a shuffle is being applied, that one decides (and looks again when it is done)
+        roll.Busy = true;
+        int epoch = _epoch;
+        try
+        {
+            for (int round = 0; round < 3 && Active(roll, epoch); round++)
+            {
+                var bridge = _bridge!;
+                var upcoming = bridge.Upcoming();
+                if (upcoming.Count > _refillAt) return;
+                var batch = TakeFromPlan(roll, bridge, upcoming);
+                if (batch.Count > 0)
+                {
+                    // Behind everything that is upcoming; the current song, the order of the queue and
+                    // what the user put next are left alone, and a song counts as heard only when it starts.
+                    void Add() => bridge.AppendUpcoming(batch);
+                    if (_priority != null) _priority.Own(Add); else Add();
+                    if (upcoming.Count + batch.Count > _refillAt) return;
+                }
+                if (roll.Remaining == 0 && !await PlanNextAsync(roll, bridge, epoch)) return;
+            }
+        }
+        catch (Exception ex)
+        {
+            roll.Finished = true;
+            if (!_closed && epoch == _epoch) Notice("More songs could not be added (" + ex.GetBaseException().Message + "). The songs already queued play on.");
+        }
+        finally { roll.Busy = false; }
+    }
+
+    /// <summary>The next songs of the plan that are still wanted: not gone from the library, not already upcoming, not heard since, and still allowed by the mode.</summary>
+    private List<TrackEntry> TakeFromPlan(RollingQueue roll, QueueBridge bridge, List<RawTrack> upcoming)
+    {
+        var library = new Dictionary<string, RawTrack>(StringComparer.Ordinal);
+        foreach (var track in bridge.SnapshotRaw("Whole library")) library.TryAdd(track.Id, track);
+        var queued = new HashSet<string>(upcoming.Select(t => t.Id), StringComparer.Ordinal);
+        if (bridge.CurrentRaw is { } playing) queued.Add(playing.Id);
+        bool explicitAllowed = bridge.ExplicitAllowed; var now = DateTime.UtcNow;
+        var batch = new List<TrackEntry>();
+        while (batch.Count < _windowSize && roll.Remaining > 0)
+        {
+            var entry = roll.Plan[roll.Next++];
+            var song = entry.Song;
+            library.TryGetValue(song.Id, out var fresh);
+            if (fresh == null && !song.Remote) continue;   // no longer in the library
+            if (!queued.Add(song.Id)) continue;            // already upcoming (or playing)
+            if (fresh != null) song = song with { PlayCount = fresh.PlayCount, Skip = fresh.Skip, Explicit = fresh.Explicit, Disliked = fresh.Disliked, SnoozedUntil = fresh.SnoozedUntil };
+            if (!ShuffleEngine.StillWanted(song, roll.Mode, _seen, explicitAllowed, roll.SkipDisliked, now)) continue;
+            batch.Add(new TrackEntry(fresh?.Native ?? entry.Native, song));
+        }
+        return batch;
+    }
+
+    /// <summary>The plan is used up: the next one, with the same mode and source. False when there is none (the session then plays out what is queued).</summary>
+    private async Task<bool> PlanNextAsync(RollingQueue roll, QueueBridge bridge, int epoch)
+    {
+        var upcoming = bridge.Upcoming();
+        var current = bridge.CurrentRaw;
+        var library = bridge.SnapshotRaw("Whole library");
+        IReadOnlyList<RawTrack> source = library;
+        if (roll.Members != null)
+        {
+            var byId = new Dictionary<string, RawTrack>(StringComparer.Ordinal);
+            foreach (var track in library) byId.TryAdd(track.Id, track);
+            source = roll.Members.Select(m => byId.TryGetValue(m.Id, out var fresh) ? fresh : m.Remote ? m : null).OfType<RawTrack>().ToList();
+        }
+        bool explicitAllowed = bridge.ExplicitAllowed; var mode = roll.Mode; bool skipDisliked = roll.SkipDisliked;
+        var known = _seen.ToArray(); var last = _last; int history = _historyVersion;
+        var planned = await Task.Run(() =>
+        {
+            var identities = roll.Identities;
+            var entries = source.Select(r => r.Entry(identities)).ToList();
+            var waiting = upcoming.Select(r => r.Entry(identities).Song.Key).ToHashSet(StringComparer.Ordinal);
+            var playing = current?.Entry(identities).Song.Key;
+            var remembered = playing != null ? known.Append(playing).ToArray() : known;
+            var built = ShuffleEngine.Build(entries.Select(e => e.Song)
+                .Where(s => s.Remote || (!string.IsNullOrWhiteSpace(s.Path) && File.Exists(s.Path))),
+                mode, remembered, playing, last, explicitAllowed, skipDisliked, upcoming: waiting);
+            var native = entries.DistinctBy(e => e.Song.Key).ToDictionary(e => e.Song.Key);
+            var queue = built.Songs.Select(s => native[s.Key]).ToList();
+            var keys = queue.SelectMany(e => new[] { e.Song.Key, e.Song.LegacyKey }).ToHashSet(StringComparer.Ordinal);
+            return (plan: built, ordered: queue, session: keys);
+        });
+        if (!Active(roll, epoch)) return false;
+        if (history != _historyVersion) return false; // the cycle was reset meanwhile: a plan made from the old history is not used
+        if (planned.plan.Songs.Count == 0)
+        {
+            if (mode == ShuffleMode.NeverPlayed)
+            {
+                roll.Finished = true;
+                Notice("No never-played songs are left in this source. The queue ends after the songs already upcoming.");
+            }
+            else roll.NotBefore = DateTime.UtcNow.AddSeconds(10); // everything eligible is queued or playing: ask again a little later
+            return false;
+        }
+        // Take over what the plan changed in the history (a fresh cycle forgets the old one), not the
+        // whole set: a song that started while the plan was being made stays remembered.
+        var kept = planned.plan.Seen as ISet<string> ?? planned.plan.Seen.ToHashSet(StringComparer.Ordinal);
+        _seen.ExceptWith(known.Where(k => !kept.Contains(k)));
+        _seen.UnionWith(planned.plan.Seen);
+        if (planned.plan.NewCycle)
+        {
+            QueueSave();
+            if (_window != null) _window.Status = "A fresh cycle started: every song in this source has been played.";
+        }
+        _session.UnionWith(planned.session);
+        roll.Plan = planned.ordered; roll.Next = 0;
+        return true;
+    }
+
+    /// <summary>The user cleared the upcoming queue or replaced it: that is the end of the session (and of the continuation), not something to fill up again.</summary>
+    private void OnQueueReplaced()
+    {
+        if (_closed || _lease == null) return;
+        EndSession();
+        Notice("True Shuffle session ended because the queue was cleared or replaced. The current song keeps playing.");
     }
 
     private void TrackChanged(object? sender, EventArgs e)
@@ -221,6 +388,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
             var current = _bridge?.Current?.Song;
             if (current != null && !_session.Contains(current.Key) && !_session.Contains(current.LegacyKey)) { EndSession(); return; }
             MarkCurrent();
+            WatchQueue();
         }
         catch (Exception ex) { Notice("Progress tracking stopped: " + ex.GetBaseException().Message); EndSession(); }
     }
@@ -263,19 +431,21 @@ public sealed class TrueShufflePlugin : INoctisPlugin
         var store = _store;
         int epoch = _epoch;
         // Chain immutable snapshots in order, so rapid Next clicks cannot persist older progress last.
+        // Every snapshot is the complete progress, so one that could not be written is made good by
+        // the next one that can; only the first failure of a streak is announced.
         _save = _save.ContinueWith(async _ =>
         {
-            try { await store.SaveAsync(snapshot); }
+            try { await store.SaveAsync(snapshot); _saveFailing = false; }
             catch (Exception ex)
             {
-                Dispatcher.UIThread.Post(() =>
-                {
-                    if (!_closed && epoch == _epoch)
+                bool first = !_saveFailing;
+                _saveFailing = true;
+                if (first)
+                    Dispatcher.UIThread.Post(() =>
                     {
-                        _historyError = ex.Message;
-                        Notice("Shuffle progress could not be saved. This queue can finish; persistent modes are paused.");
-                    }
-                });
+                        if (!_closed && epoch == _epoch)
+                            Notice("Shuffle progress could not be saved (" + ex.GetBaseException().Message + "). It is tried again with the next song; this queue can finish.");
+                    });
             }
         }, TaskScheduler.Default).Unwrap();
     }
@@ -288,7 +458,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
         await _load;
         if (_closed || epoch != _epoch) return;
         if (_historyError != null) { Notice("Invalid history was preserved. Inspect cycle.json in the plugin data folder."); return; }
-        _seen.Clear(); _last = null; _lastPath = null;
+        _seen.Clear(); _last = null; _lastPath = null; _historyVersion++;
         if (_lease != null) MarkCurrent();
         QueueSave();
         if (_window != null) _window.Status = "Remembered cycle reset. The playing queue was kept.";
@@ -298,6 +468,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
     {
         if (cancelPending) ++_pending;
         _priority?.Dispose(); _priority=null;
+        var roll = _roll; _roll = null; if (roll != null) roll.Finished = true; // no more songs are added
         if (_bridge?.Player is INotifyPropertyChanged events) events.PropertyChanged -= PlayerChanged;
         _session.Clear();
         var lease = _lease; _lease = null;
@@ -328,5 +499,8 @@ public sealed class TrueShufflePlugin : INoctisPlugin
         _window?.Close(); _window = null;
         _command?.Dispose(); _command = null;
         _bridge = null; _host = null;
+        // The song that started last should not be forgotten because Noctis closed a moment later.
+        // The writer never needs this thread, so waiting cannot deadlock; two seconds at most.
+        try { if (!_save.IsCompleted) _save.Wait(TimeSpan.FromSeconds(2)); } catch (Exception) { }
     }
 }

@@ -45,17 +45,30 @@ public static class ShuffleEngine
         }
         return new(1, seen.ToArray(), last, lastPath);
     }
-    public static List<Song> Eligible(IEnumerable<Song> songs, bool explicitAllowed, bool skipDisliked, DateTime now)
-        => songs.Where(s => !s.Skip && (explicitAllowed || !s.Explicit) && (!skipDisliked || !s.Disliked)
-               && (s.SnoozedUntil == null || s.SnoozedUntil <= now))
-            .DistinctBy(s => s.Key).ToList();
+    public static bool IsEligible(Song s, bool explicitAllowed, bool skipDisliked, DateTime now)
+        => !s.Skip && (explicitAllowed || !s.Explicit) && (!skipDisliked || !s.Disliked)
+           && (s.SnoozedUntil == null || s.SnoozedUntil <= now);
 
+    public static List<Song> Eligible(IEnumerable<Song> songs, bool explicitAllowed, bool skipDisliked, DateTime now)
+        => songs.Where(s => IsEligible(s, explicitAllowed, skipDisliked, now)).DistinctBy(s => s.Key).ToList();
+
+    /// <summary>
+    /// The rules of a mode, asked again when a rolling queue takes a song from its plan: since the plan
+    /// was made the song may have been heard, skipped, snoozed or played for the first time.
+    /// </summary>
+    public static bool StillWanted(Song song, ShuffleMode mode, ISet<string> seen, bool explicitAllowed, bool skipDisliked, DateTime now)
+        => IsEligible(song, explicitAllowed, skipDisliked, now)
+           && (mode != ShuffleMode.NeverPlayed || song.PlayCount == 0)
+           && (mode == ShuffleMode.EqualChance || !seen.Contains(song.Key));
+
+    /// <param name="upcoming">Keys of songs that are already waiting in the queue: a later plan must not repeat them.</param>
     public static ShufflePlan Build(IEnumerable<Song> input, ShuffleMode mode, IEnumerable<string> remembered,
         string? current, string? last, bool explicitAllowed = true, bool skipDisliked = false,
-        DateTime? now = null, Func<int, int>? draw = null)
+        DateTime? now = null, Func<int, int>? draw = null, ISet<string>? upcoming = null)
     {
         draw ??= RandomNumberGenerator.GetInt32;
         var pool = Eligible(input, explicitAllowed, skipDisliked, now ?? DateTime.UtcNow);
+        if (upcoming != null) pool = pool.Where(s => !upcoming.Contains(s.Key)).ToList();
         var seen = new HashSet<string>(remembered, StringComparer.Ordinal);
         if (current != null) seen.Add(current);
         var available = pool.Where(s => s.Key != current).ToList();

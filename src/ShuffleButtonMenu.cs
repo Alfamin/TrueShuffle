@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using System.Windows.Input;
 using Avalonia;
@@ -24,6 +25,25 @@ public sealed class ShuffleButtonMenu : IDisposable
     public ShuffleButtonMenu(ICommand native, Func<ShuffleMode, string, Task> apply, Action normal,
         Action open, Action<string> error)
     { _native = native; _apply = apply; _normal = normal; _open = open; _error = error; }
+
+    /// <summary>How many shuffle buttons carry the menu right now.</summary>
+    public int Count => _buttons.Count;
+
+    /// <summary>
+    /// Looking for the buttons walks the visual tree of every window. Until they are found (the
+    /// windows may still be loading) that happens every second for half a minute; after that, and
+    /// once they are attached, every five seconds. A window that came or went is looked at at once.
+    /// </summary>
+    public static TimeSpan ScanInterval(int attached, TimeSpan sinceStart)
+        => attached > 0 || sinceStart >= TimeSpan.FromSeconds(30) ? TimeSpan.FromSeconds(5) : TimeSpan.FromSeconds(1);
+
+    /// <summary>Changes when a window is opened or closed (the mini player, say).</summary>
+    public static int Fingerprint(IEnumerable<Window> windows)
+    {
+        var hash = new HashCode();
+        foreach (var window in windows) hash.Add(RuntimeHelpers.GetHashCode(window));
+        return hash.ToHashCode();
+    }
 
     public void Refresh(IEnumerable<Visual> roots)
     {
@@ -118,7 +138,11 @@ public sealed class ShuffleButtonMenu : IDisposable
             e.Handled = true;
             try { Menu.Open(_button); } catch (Exception ex) { _error(ex.GetBaseException().Message); }
         }
-        public void Tip(string text) { _tip = text; _button.SetCurrentValue(ToolTip.TipProperty, text); }
+        public void Tip(string text)
+        {
+            _tip = text;
+            if (!Equals(ToolTip.GetTip(_button), text)) _button.SetCurrentValue(ToolTip.TipProperty, text); // unchanged text is not set again
+        }
         public void Dispose()
         {
             _button.RemoveHandler(Button.ClickEvent, Click); Menu.Close();
