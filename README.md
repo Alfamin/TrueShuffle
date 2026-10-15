@@ -1,5 +1,14 @@
 # True Shuffle for Noctis
 
+Version 1.4.1 fixes the switch to another playlist. When the shuffle held the whole library (for example a
+mode picked for the current queue after playing the Songs page from the top), a song played on the Gym
+playlist kept the library shuffle, because every Gym song is part of the library. What counts now is
+where you played from: the Songs page is the whole library, a playlist's page is that playlist (its search
+box included), and any other list is the same list only when nearly every song of each is in the other.
+A playlist's or album's **Shuffle** button no longer ends True Shuffle either: Noctis turns its own
+shuffle on there, and True Shuffle now takes that over, shuffling that list in your mode behind the songs
+you added.
+
 Version 1.4.0 works like two queues, the way Spotify does. Songs you add yourself (**Add to Queue**, **Play
 Next**) are your queue: they wait ahead of the shuffle, in the order you added them, and stay there
 whatever the shuffle does. Behind them is the shuffle of what you are listening to. Play a song from

@@ -15,7 +15,7 @@ namespace TrueShuffle;
 
 public sealed class TrueShufflePlugin : INoctisPlugin
 {
-    public PluginInfo Info { get; } = new("dev.moshi.trueshuffle", "True Shuffle", "1.4.0", "moshi",
+    public PluginInfo Info { get; } = new("dev.moshi.trueshuffle", "True Shuffle", "1.4.1", "moshi",
         "Equal-chance shuffle, persistent no-repeat cycles, and discovery modes for your queue, playlist or library.");
     private IPluginHost? _host;
     private IDisposable? _command;
@@ -174,6 +174,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
             // costs is each song's file identity (it opens the file): that, the history upgrade, the
             // shuffle and the session keys are all worked out on a thread of our own.
             var raw = bridge.SnapshotRaw(scope);
+            var openPlaylist = scope == "Open playlist" ? bridge.OpenPlaylistId : null;
             var libraryRaw = scope == "Whole library" ? raw : bridge.SnapshotRaw("Whole library");
             var current = bridge.Current?.Song;
             string? currentKey = keepCurrent ? current?.Key : null;
@@ -232,7 +233,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
                         }
                         Notice($"{requested.Count} song{(requested.Count==1 ? "" : "s")} queued ahead of the shuffle.");
                     },Notice,OnQueueReplaced,OnPlayedNow);
-                _roll = new RollingQueue(mode, scope, skipDisliked, scope == "Whole library" ? null : raw, ordered, first.Count, prepared.identities);
+                _roll = new RollingQueue(mode, scope, skipDisliked, scope == "Whole library" ? null : raw, ordered, first.Count, prepared.identities) { Playlist = openPlaylist };
             }
             catch { _seen = previousSeen; _last = previousLast; _lastPath = previousLastPath; EndSession(); throw; }
             finally { _ownChange = false; }
@@ -398,6 +399,9 @@ public sealed class TrueShufflePlugin : INoctisPlugin
             bool NotPlaying(object track) => playing == null || !QueueFrontPolicy.Same(track, playing);
             var list = bridge.PlayedList(); // before ReplaceUpcoming, which forgets the songs above the picked one
             var next = Context(roll, before, playing, list, bridge);
+            // A Shuffle button of a list turns Noctis's own shuffle on as it starts the list: True Shuffle shuffles it instead.
+            if (QueueBridge.Get(bridge.Player, "IsShuffleEnabled") is true)
+                policy.Own(() => ((System.Windows.Input.ICommand)QueueBridge.Get(bridge.Player, "ToggleShuffleCommand")!).Execute(null));
             if (next == null) policy.Own(() => bridge.ReplaceUpcoming(before.Where(NotPlaying).ToList()));
             else
             {
@@ -441,18 +445,24 @@ public sealed class TrueShufflePlugin : INoctisPlugin
         var earlier = new HashSet<object>(before, ReferenceEqualityComparer.Instance);
         if (list.All(track => earlier.Contains(track) || ReferenceEquals(track, playing))) return null; // the queue panel: a song of the upcoming queue
         var library = bridge.SnapshotRaw("Whole library").Select(t => t.Id).ToHashSet(StringComparer.Ordinal);
-        bool MostOf(IEnumerable<string> ids, ICollection<string> of, double share) => of.Count > 0 && ids.Count(of.Contains) >= share * of.Count;
-        RollingQueue New(IReadOnlyList<RawTrack>? members) => new(roll.Mode, members == null ? "Whole library" : "Current queue", roll.SkipDisliked, members,
-            new List<TrackEntry>(), 0, roll.Busy ? new(StringComparer.Ordinal) : new(roll.Identities, StringComparer.Ordinal));
+        bool MostOf(ICollection<string> ids, ICollection<string> of) => of.Count > 0 && ids.Count(of.Contains) >= 0.95 * of.Count;
+        // Two lists are the same list when nearly every song of each is in the other. Being part of a bigger list is not
+        // enough: every playlist is part of the library.
+        bool Alike(ICollection<string> a, ICollection<string> b) { int both = a.Count(b.Contains); return both >= 0.9 * a.Count && both >= 0.9 * b.Count; }
+        RollingQueue New(IReadOnlyList<RawTrack>? members, string? playlist) => new(roll.Mode, members == null ? "Whole library" : "Current queue", roll.SkipDisliked, members,
+            new List<TrackEntry>(), 0, roll.Busy ? new(StringComparer.Ordinal) : new(roll.Identities, StringComparer.Ordinal)) { Playlist = playlist };
         var shuffled = roll.Members?.Select(t => t.Id).ToHashSet(StringComparer.Ordinal);
+        bool shufflingLibrary = shuffled == null || MostOf(shuffled, library);
         // The Songs page is the whole library, whatever its search box shows.
-        if (bridge.SongsPageOpen)
-            return shuffled == null || MostOf(shuffled, library, 0.95) ? null : New(null);
+        if (bridge.SongsPageOpen) return shufflingLibrary ? null : New(null, null);
+        // A playlist's page is that playlist, whatever its search box shows.
+        var playlist = bridge.OpenPlaylistId;
+        if (playlist != null && playlist == roll.Playlist) return null;
         var raw = list.Select(bridge.Raw).ToList();
-        var ids = raw.Select(t => t.Id).Distinct(StringComparer.Ordinal).ToList();
-        if (shuffled == null) return MostOf(ids, library, 0.95) ? null : New(raw);
-        // Part of the list being shuffled (a search inside it, say) is the same list.
-        return ids.Count(shuffled.Contains) >= 0.9 * ids.Count ? null : New(raw);
+        var ids = raw.Select(t => t.Id).ToHashSet(StringComparer.Ordinal);
+        if (MostOf(ids, library)) return shufflingLibrary ? null : New(null, null); // a page that lists the whole library (the root folder, say)
+        if (!shufflingLibrary && (playlist == null || roll.Playlist == null) && Alike(ids, shuffled!)) return null; // the same album, artist or folder again
+        return New(raw, playlist);
     }
 
     /// <summary>
@@ -571,7 +581,8 @@ public sealed class TrueShufflePlugin : INoctisPlugin
         if (_ownChange || _lease == null || _bridge == null) return;
         try
         {
-        bool normalControls = e.PropertyName == "IsShuffleEnabled" && (bool)QueueBridge.Get(_bridge.Player, "IsShuffleEnabled")!;
+        // A Shuffle button of a list also turns Noctis's shuffle on, while it starts that list (OnPlayedNow takes that over).
+        bool normalControls = e.PropertyName == "IsShuffleEnabled" && (bool)QueueBridge.Get(_bridge.Player, "IsShuffleEnabled")! && _priority?.Starting != true;
         bool auto = e.PropertyName == "AutoplayEnabled" && (bool)QueueBridge.Get(_bridge.Player, "AutoplayEnabled")!;
         bool radio = e.PropertyName == "IsRadioActive" && (bool)QueueBridge.Get(_bridge.Player, "IsRadioActive")!;
         bool repeat = e.PropertyName == "RepeatMode" && QueueBridge.Get(_bridge.Player, "RepeatMode")!.ToString() != "Off";

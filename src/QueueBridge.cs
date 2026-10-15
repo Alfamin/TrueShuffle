@@ -135,6 +135,10 @@ public sealed class QueueBridge
         return list;
     }
 
+    /// <summary>The playlist whose page is open in Noctis, if one is.</summary>
+    public string? OpenPlaylistId => Get(_main, "CurrentView") is object view && view.GetType().FullName == "Noctis.ViewModels.PlaylistViewModel"
+        ? Get(view, "PlaylistId")?.ToString() : null;
+
     /// <summary>The Songs page (the whole library, maybe filtered by a search) is the page open in Noctis.</summary>
     public bool SongsPageOpen => Get(_main, "CurrentView")?.GetType().FullName == "Noctis.ViewModels.LibrarySongsViewModel";
 

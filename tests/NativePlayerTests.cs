@@ -324,6 +324,42 @@ internal static class NativePlayerTests
             var free = songs.Cast<object>().First(t => !ReferenceEquals(t, Playing()));
             replace.Invoke(player, new object[] { songs, songs.IndexOf(free) }); Settle();
             check(ReferenceEquals(Playing(), free) && Upcoming().Length == songs.Count - songs.IndexOf(free) - 1, "Without a session, playing from a list is Noctis's own behaviour again");
+
+            // As used: the Songs page is played from the top (the whole library is queued), a mode is picked for the current queue,
+            // a song is added to the queue, then a song is played on the Gym playlist's page. Every Gym song is in that
+            // library-wide shuffle, and still Gym is what is shuffled now.
+            shell.CurrentView = new Noctis.ViewModels.LibrarySongsViewModel();
+            replace.Invoke(player, new object[] { songs, 0 }); Settle();
+            var whole = (Task)typeof(TrueShufflePlugin).GetMethod("ApplyAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .Invoke(plugin, new object[] { ShuffleMode.EqualChance, "Current queue", true, false })!;
+            Pump(() => whole.IsCompleted); Settle();
+            check(Active() && Upcoming().Length == 10, "A current-queue shuffle that holds the whole library is running");
+            var gymList = (IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(trackType))!;
+            var otherList = (IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(trackType))!;
+            var spare = songs.Cast<object>().Where(t => !ReferenceEquals(t, Playing())).ToArray();
+            foreach (var track in spare.Skip(1).Take(8)) gymList.Add(track);
+            foreach (var track in spare.Skip(20).Take(6)) otherList.Add(track);
+            Call("AddToQueue", spare[0]); Settle();
+            var gym = new Noctis.ViewModels.PlaylistViewModel { PlaylistId = Guid.NewGuid(), Tracks = gymList };
+            shell.CurrentView = gym;
+            replace.Invoke(player, new object[] { gymList, 3 }); Settle();
+            queue = Upcoming();
+            check(ReferenceEquals(Playing(), gymList[3]) && ReferenceEquals(queue[0], spare[0]) && queue.Length == 8
+                && queue.Skip(1).All(t => gymList.Contains(t)) && Active(),
+                "A song from a playlist page switches a library-wide shuffle to that playlist, the added song still first");
+            // A search on that page shows part of the playlist: it is the same playlist, so the shuffle stays.
+            var narrowed = (IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(trackType))!;
+            narrowed.Add(gymList[3]!); narrowed.Add(queue[3]); narrowed.Add(gymList[7]!); // with the song played before, which is no longer upcoming
+            replace.Invoke(player, new object[] { narrowed, 1 }); Settle();
+            check(ReferenceEquals(Playing(), queue[3]) && Upcoming().SequenceEqual(queue.Where(t => !ReferenceEquals(t, queue[3]))), "A search inside the playlist being shuffled keeps its shuffle");
+            // Another playlist's Shuffle button: Noctis starts it with its own shuffle turned on; True Shuffle takes it over.
+            shell.CurrentView = new Noctis.ViewModels.PlaylistViewModel { PlaylistId = Guid.NewGuid(), Tracks = otherList };
+            Call("PlayShuffled", otherList); Settle();
+            queue = Upcoming();
+            check(Active() && Get(player, "IsShuffleEnabled") is false && otherList.Contains(Playing()) && ReferenceEquals(queue[0], spare[0])
+                && queue.Skip(1).All(t => otherList.Contains(t)) && queue.Length == otherList.Count,
+                "A playlist's Shuffle button keeps the session: that playlist in the True Shuffle mode, behind the added song");
+            shell.CurrentView = null;
         }
         finally
         {
@@ -382,4 +418,6 @@ namespace Noctis.ViewModels
 {
     /// <summary>Stands for Noctis's Songs page: the plugin knows that page by this name.</summary>
     internal sealed class LibrarySongsViewModel { }
+    /// <summary>Stands for a playlist's page.</summary>
+    internal sealed class PlaylistViewModel { public Guid PlaylistId { get; set; } public IEnumerable? Tracks { get; set; } }
 }

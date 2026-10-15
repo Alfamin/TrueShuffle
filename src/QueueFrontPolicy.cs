@@ -58,6 +58,9 @@ public sealed class QueueFrontPolicy : IDisposable
     /// </summary>
     public bool Replacing=>_replacedFrom!=null;
 
+    /// <summary>Noctis has just moved the playing song to its history to start another list: the queue is replaced next, in the same call.</summary>
+    public bool Starting=>_historyPushed;
+
     /// <summary>The songs among <paramref name="rows"/> that the user put in the queue themselves, in the order given.</summary>
     public List<object> Manual(IEnumerable<object> rows)
     {
@@ -177,7 +180,14 @@ public sealed class QueueFrontPolicy : IDisposable
             else if (_replaced!=null && from.Length>0 && _freshRows) _replaced();
         }
         catch(Exception ex) { _error("Could not keep the shuffle behind the song you played: "+ex.GetBaseException().Message); }
-        finally { if (!_disposed && !_editing) _before=Snapshot(); }
+        finally
+        {
+            if (!_disposed && !_editing)
+            {
+                _before=Snapshot();
+                _manual.IntersectWith(_before); // a song of the user's that is not back in the queue is the one that started
+            }
+        }
     }
 
     private static string? Recording(object track)
@@ -241,11 +251,7 @@ public sealed class QueueFrontPolicy : IDisposable
     {
         var was=_editing; _editing=true;
         try { change(); }
-        finally
-        {
-            _editing=was; _before=Snapshot();
-            if (_replacedFrom==null) _manual.IntersectWith(_before); // a song of the user's that the change left out has played or gone
-        }
+        finally { _editing=was; _before=Snapshot(); }
     }
     public void Dispose()
     {

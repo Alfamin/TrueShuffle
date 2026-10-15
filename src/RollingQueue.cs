@@ -21,6 +21,8 @@ internal sealed class RollingQueue
     public bool SkipDisliked { get; }
     /// <summary>For a source that is not the library: the songs it had when the shuffle was applied (a later plan is made from them).</summary>
     public IReadOnlyList<RawTrack>? Members { get; }
+    /// <summary>The playlist this shuffle was started from, when it was started on a playlist's page (its search can show part of it).</summary>
+    public string? Playlist { get; init; }
     public List<TrackEntry> Plan { get; set; }
     /// <summary>The first song of <see cref="Plan"/> that is not in the native queue yet.</summary>
     public int Next { get; set; }
