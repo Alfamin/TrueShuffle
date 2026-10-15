@@ -15,7 +15,7 @@ namespace TrueShuffle;
 
 public sealed class TrueShufflePlugin : INoctisPlugin
 {
-    public PluginInfo Info { get; } = new("dev.moshi.trueshuffle", "True Shuffle", "1.2.0", "moshi",
+    public PluginInfo Info { get; } = new("dev.moshi.trueshuffle", "True Shuffle", "1.3.0", "moshi",
         "Equal-chance shuffle, persistent no-repeat cycles, and discovery modes for your queue, playlist or library.");
     private IPluginHost? _host;
     private IDisposable? _command;
@@ -32,6 +32,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
     private HashSet<string> _session = new(StringComparer.Ordinal);
     private string? _last, _lastPath, _historyError;
     private bool _closed, _busy, _ownChange;
+    private bool _toldPlayNow; // the notice that explains a song played from a list is shown once per run
     private volatile bool _saveFailing; // the last attempt to save progress failed (history that could not be LOADED is _historyError)
     private int _epoch, _pending, _historyVersion; // _historyVersion changes whenever the remembered history is replaced or reset
     private string? _buttonError;
@@ -48,7 +49,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
         _host = host;
         _closed = false;
         _busy = false;
-        _seen = new(StringComparer.Ordinal); _last = null; _lastPath = null; _historyError = null; _saveFailing = false;
+        _seen = new(StringComparer.Ordinal); _last = null; _lastPath = null; _historyError = null; _saveFailing = false; _toldPlayNow = false;
         int epoch = ++_epoch;
         _store = new CycleStore(host.DataDirectory);
         _load = LoadAsync(_store, epoch);
@@ -124,7 +125,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
             _buttons ??= new ShuffleButtonMenu((ICommand)QueueBridge.Get(_bridge!.Player, "ToggleShuffleCommand")!,
                 (mode, scope) => ApplyAsync(mode, scope, true, _host.Settings.GetBool("skipDisliked", false)),
                 () => { EndSession(); ((ICommand)QueueBridge.Get(_bridge!.Player, "ToggleShuffleCommand")!).Execute(null); },
-                Open, Notice);
+                Open, Notice, EndByUser);
             // Finding the buttons walks the visual tree of every window, so a tick does that only when a
             // window came or went (the mini player) or when the pause is over; the shortcut always looks.
             var now = DateTime.UtcNow;
@@ -230,7 +231,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
                             _session.Add(song.Key);_session.Add(song.LegacyKey);
                         }
                         Notice($"{requested.Count} song{(requested.Count==1 ? "" : "s")} added next, ahead of the shuffle.");
-                    },Notice,OnQueueReplaced);
+                    },Notice,OnQueueReplaced,OnPlayedNow);
                 _roll = new RollingQueue(mode, scope, skipDisliked, scope == "Whole library" ? null : raw, ordered, first.Count, prepared.identities);
             }
             catch { _seen = previousSeen; _last = previousLast; _lastPath = previousLastPath; EndSession(); throw; }
@@ -380,9 +381,49 @@ public sealed class TrueShufflePlugin : INoctisPlugin
         Notice("True Shuffle session ended because the queue was cleared or replaced. The current song keeps playing.");
     }
 
+    /// <summary>
+    /// Noctis plays a song by making the list it was picked from the new queue (the queue panel drops the songs above it, the
+    /// history plays it alone). During a session the song plays now and the shuffle that was upcoming stays behind it, in its
+    /// order; a copy of the song further down is taken out so it does not play twice.
+    /// </summary>
+    private void OnPlayedNow(IReadOnlyList<object> before)
+    {
+        if (_closed || _lease == null || _bridge == null || _priority == null) return;
+        var bridge = _bridge; var policy = _priority;
+        try
+        {
+            var playing = QueueBridge.Get(bridge.Player, "CurrentTrack");
+            var keep = before.Where(track => playing == null || !QueueFrontPolicy.Same(track, playing)).ToList();
+            policy.Own(() => bridge.ReplaceUpcoming(keep));
+            var song = bridge.Current?.Song;
+            if (song != null) { _session.Add(song.Key); _session.Add(song.LegacyKey); }
+            MarkCurrent();
+            if (!_toldPlayNow)
+            {
+                _toldPlayNow = true;
+                Notice("Playing it now; your shuffle continues after it. To play a whole album or playlist instead, choose End True Shuffle on the shuffle button first.");
+            }
+            WatchQueue();
+        }
+        catch (Exception ex)
+        {
+            EndSession();
+            Notice("True Shuffle session ended: the shuffle could not be kept behind the song you played (" + ex.GetBaseException().Message + ").");
+        }
+    }
+
+    /// <summary>The shuffle button's End True Shuffle: the queue stays as it is and Noctis's own controls are back.</summary>
+    private void EndByUser()
+    {
+        if (_lease == null) return;
+        EndSession();
+        Notice("True Shuffle ended. The queue stays as it is; playing a song or album now replaces it, as usual in Noctis.");
+    }
+
     private void TrackChanged(object? sender, EventArgs e)
     {
         if (_lease == null || _closed) return;
+        if (_priority?.Replacing == true) return; // a song picked from a list is starting: OnPlayedNow takes it from here
         try
         {
             var current = _bridge?.Current?.Song;

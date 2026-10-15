@@ -96,6 +96,29 @@ public sealed class QueueBridge
         }
         Append(list);
     }
+    /// <summary>
+    /// Puts these songs in the upcoming queue instead of what is there now; the playing song is not touched. If that fails, the
+    /// upcoming songs are put back as they were. Noctis's memory of the list a song was started from (Previous steps back
+    /// through it) is cleared as well, so Previous returns to the song that played before.
+    /// </summary>
+    public void ReplaceUpcoming(IReadOnlyList<object> tracks)
+    {
+        var list = (IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(_trackType))!;
+        foreach (var track in tracks) { if (!_trackType.IsInstanceOfType(track)) throw Changed(); list.Add(track); }
+        var original = (IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(_trackType))!;
+        foreach (var track in (IEnumerable)Get(Player, "UpNext")!) original.Add(track);
+        _clear.Invoke(Player, null);
+        try { Append(list); }
+        catch (Exception failed)
+        {
+            try { _clear.Invoke(Player, null); Append(original); }
+            catch (Exception recovery) { throw new AggregateException("The queue could not be rearranged or put back. No music files were changed.", failed, recovery); }
+            throw new InvalidOperationException("The queue could not be rearranged; it was left as Noctis made it.", failed);
+        }
+        if (Player.GetType().GetField("_precedingInQueue", BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(Player) is IList preceding
+            && preceding.GetType().IsGenericType && preceding.GetType().GetGenericArguments()[0] == _trackType) preceding.Clear();
+    }
+
     public TrackEntry Entry(object native)=>Wrap(native);
     public bool ExplicitAllowed => Get(_main, "Settings") is object s ? (bool)(Get(s, "AllowExplicitContent") ?? throw Changed()) : throw Changed();
 

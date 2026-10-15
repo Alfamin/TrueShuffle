@@ -75,7 +75,7 @@ internal static class UiTests
 
     private static void ShuffleButton(Action<bool, string> check)
     {
-        int nativeToggles = 0, applications = 0, opens = 0;
+        int nativeToggles = 0, applications = 0, opens = 0, ends = 0;
         ShuffleMode picked = ShuffleMode.EqualChance; string selectedScope = "";
         var command = new FakeCommand(() => nativeToggles++);
         var native = new TestShuffleButton { Content = "Shuffle", Command = command };
@@ -86,7 +86,7 @@ internal static class UiTests
         root.Show();
         var menu = new ShuffleButtonMenu(command,
             (mode, scope) => { applications++; picked = mode; selectedScope = scope; return Task.CompletedTask; },
-            () => command.Execute(null), () => opens++, _ => { });
+            () => command.Execute(null), () => opens++, _ => { }, () => ends++);
         menu.Refresh(new[] { root }); menu.Refresh(new[] { root });
         check(native.ContextMenu != original && other.ContextMenu == null && nativeToggles == 0, "Only shuffle-bound buttons gain a menu; attach never toggles playback");
         int tipSets = 0;
@@ -100,6 +100,8 @@ internal static class UiTests
             && ShuffleButtonMenu.ScanInterval(0, TimeSpan.FromSeconds(31)) == TimeSpan.FromSeconds(5), "Scans back off once the buttons are attached, and later when there are none");
         native.Activate(); Dispatcher.UIThread.RunJobs();
         check(native.ContextMenu!.IsOpen && nativeToggles == 0, "Actual Button.OnClick opens choices without also running weighted shuffle");
+        var end = native.ContextMenu.Items.OfType<MenuItem>().Single(i => Equals(i.Header, "End True Shuffle"));
+        check(!end.IsEnabled, "End True Shuffle is offered only while a True Shuffle mode is active");
         var noRepeats = native.ContextMenu.Items.OfType<MenuItem>().Single(i => Equals(i.Header, "No repeats"));
         noRepeats.RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent)); Dispatcher.UIThread.RunJobs();
         check(applications == 1 && picked == ShuffleMode.NoRepeats && selectedScope == "Current queue", "Shuffle-button mode applies directly without opening plugin settings");
@@ -109,6 +111,9 @@ internal static class UiTests
         check(applications == 2 && picked == ShuffleMode.Discovery && selectedScope == "Whole library", "Source submenu supplies its exact scope");
         menu.Selected(ShuffleMode.Discovery, "Whole library");
         check(discover.IsChecked && !noRepeats.IsChecked && ToolTip.GetTip(native)!.ToString()!.Contains("Discovery"), "Selected mode appears in menu and button tooltip");
+        check(end.IsEnabled, "... and End True Shuffle becomes available");
+        end.RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent)); Dispatcher.UIThread.RunJobs();
+        check(ends == 1 && nativeToggles == 0, "End True Shuffle ends the session without touching native shuffle");
         var normal = native.ContextMenu.Items.OfType<MenuItem>().Single(i => Equals(i.Header, "Noctis shuffle (normal)"));
         normal.RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent)); Dispatcher.UIThread.RunJobs();
         check(nativeToggles == 1, "Normal native shuffle remains available exactly once");

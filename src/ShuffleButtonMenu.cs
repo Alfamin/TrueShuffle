@@ -18,13 +18,16 @@ public sealed class ShuffleButtonMenu : IDisposable
     private readonly ICommand _native;
     private readonly Func<ShuffleMode, string, Task> _apply;
     private readonly Action _normal, _open;
+    private readonly Action? _end;
     private readonly Action<string> _error;
+    private const string EndTag = "end";
     private readonly Dictionary<Button, Attachment> _buttons = new();
     private ShuffleMode? _selected;
     private string? _scope;
+    /// <param name="end">End True Shuffle: offered while a mode is active; the queue stays as it is.</param>
     public ShuffleButtonMenu(ICommand native, Func<ShuffleMode, string, Task> apply, Action normal,
-        Action open, Action<string> error)
-    { _native = native; _apply = apply; _normal = normal; _open = open; _error = error; }
+        Action open, Action<string> error, Action? end = null)
+    { _native = native; _apply = apply; _normal = normal; _open = open; _error = error; _end = end; }
 
     /// <summary>How many shuffle buttons carry the menu right now.</summary>
     public int Count => _buttons.Count;
@@ -63,7 +66,10 @@ public sealed class ShuffleButtonMenu : IDisposable
         foreach (var attachment in _buttons.Values)
         {
             foreach (var item in Items(attachment.Menu))
+            {
                 if (item.Tag is Selection selection) item.IsChecked = mode == selection.Mode && scope == selection.Scope;
+                else if (Equals(item.Tag, EndTag)) item.IsEnabled = mode != null;
+            }
             attachment.Tip(mode == null ? "Shuffle modes (True Shuffle)" : $"True Shuffle: {Label(mode.Value)} - {scope}");
         }
     }
@@ -84,6 +90,12 @@ public sealed class ShuffleButtonMenu : IDisposable
         items.Add(new MenuItem { Header = "Open playlist", ItemsSource = Modes("Open playlist") });
         items.Add(new MenuItem { Header = "Whole library", ItemsSource = Modes("Whole library") });
         items.Add(new Separator());
+        if (_end != null)
+        {
+            var end = new MenuItem { Header = "End True Shuffle", Tag = EndTag, IsEnabled = _selected != null };
+            end.Click += (_, _) => { try { _end(); } catch (Exception e) { _error(e.GetBaseException().Message); } };
+            items.Add(end);
+        }
         var normal = new MenuItem { Header = "Noctis shuffle (normal)" };
         normal.Click += (_, _) => { try { _normal(); } catch (Exception e) { _error(e.GetBaseException().Message); } };
         var controls = new MenuItem { Header = "More shuffle controls…" };

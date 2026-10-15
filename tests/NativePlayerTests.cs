@@ -161,7 +161,118 @@ internal static class NativePlayerTests
         {
             if (player is IDisposable disposable) disposable.Dispose();
         }
+        PlayNow(ctor, args, library, trackType, check);
     }
+
+    /// <summary>
+    /// A song played from a list, the queue panel or the history during a session, on the installed player: Noctis replaces the
+    /// queue with that list, True Shuffle plays the song now and puts the shuffle back behind it.
+    /// </summary>
+    private static void PlayNow(ConstructorInfo ctor, object?[] args, ServiceStub library, Type trackType, Action<bool, string> check)
+    {
+        var folder = Path.Combine(Path.GetTempPath(), "shuffle-playnow-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(folder);
+        var songs = (IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(trackType))!;
+        for (int i = 0; i < 30; i++)
+        {
+            var track = Activator.CreateInstance(trackType)!;
+            Set(track, "Id", Guid.NewGuid()); Set(track, "Title", "Library " + i); Set(track, "Artist", "Test artist");
+            Set(track, "Duration", TimeSpan.FromMinutes(3)); Set(track, "FilePath", Path.Combine(folder, "song " + i + ".mp3"));
+            File.WriteAllText((string)Get(track, "FilePath")!, "synthetic audio");
+            songs.Add(track);
+        }
+        library.Values["get_Tracks"] = songs;
+        var player = ctor.Invoke(args);
+        var playerType = player.GetType();
+        var listOf = typeof(IList<>).MakeGenericType(trackType);
+        var replace = playerType.GetMethod("ReplaceQueueAndPlay", new[] { listOf, typeof(int) })!;
+        IList One(object track) { var l = (IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(trackType))!; l.Add(track); return l; }
+        object[] Upcoming() => ((IEnumerable)Get(player, "UpNext")!).Cast<object>().ToArray();
+        object Playing() => Get(player, "CurrentTrack")!;
+        var host = new UiHost(Path.Combine(folder, "plugin-data"));
+        var plugin = new TrueShufflePlugin();
+        object? Field(string name) => typeof(TrueShufflePlugin).GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(plugin);
+        void SetField(string name, object value) => typeof(TrueShufflePlugin).GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(plugin, value);
+        void Pump(Func<bool> ready)
+        {
+            var until = DateTime.UtcNow.AddSeconds(8);
+            while (!ready() && DateTime.UtcNow < until) { Dispatcher.UIThread.RunJobs(); System.Threading.Thread.Sleep(2); }
+            Dispatcher.UIThread.RunJobs();
+            if (!ready()) throw new Exception("Headless operation did not finish");
+        }
+        void Settle() { Dispatcher.UIThread.RunJobs(); Pump(() => ((Task)Field("_refill")!).IsCompleted); }
+        bool Active() => Field("_lease") != null && Field("_roll") != null;
+        // Noctis tells plugins about a song change from the player's own property change, at once.
+        ((System.ComponentModel.INotifyPropertyChanged)player).PropertyChanged += (_, e) => { if (e.PropertyName == "CurrentTrack") host.Playing.Fire(); };
+        try
+        {
+            replace.Invoke(player, new object[] { songs, 0 }); Dispatcher.UIThread.RunJobs();
+            plugin.Initialize(host);
+            Pump(() => ((Task)Field("_load")!).IsCompleted);
+            SetField("_bridge", new QueueBridge(new NativeShell(player, library), false)); SetField("_windowSize", 10); SetField("_refillAt", 3);
+            var apply = (Task)typeof(TrueShufflePlugin).GetMethod("ApplyAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .Invoke(plugin, new object[] { ShuffleMode.NoRepeats, "Whole library", true, false })!;
+            Pump(() => apply.IsCompleted); Settle();
+            var shuffle = Upcoming();
+            var interrupted = Playing();
+            check(Active() && shuffle.Length == 10, "Installed player: a session with ten upcoming songs is running");
+
+            // Double-click in the Songs list: Noctis makes the whole list the queue, from the song picked.
+            var picked = songs.Cast<object>().First(t => !shuffle.Contains(t) && !ReferenceEquals(t, interrupted));
+            replace.Invoke(player, new object[] { songs, songs.IndexOf(picked) }); Settle();
+            check(ReferenceEquals(Playing(), picked) && Upcoming().SequenceEqual(shuffle), "A song played from a list plays now and the shuffle stays behind it, in its order");
+            check(Active() && host.Notices.Count(n => n.Contains("Playing it now")) == 1 && !host.Notices.Any(n => n.Contains("session ended")), "... the session goes on, with one notice that says so");
+            var heard = (HashSet<string>)Field("_seen")!;
+            check(heard.Contains(new QueueBridge(new NativeShell(player, library), false).Current!.Song.Key), "... and the picked song counts as heard in the cycle");
+            ((ICommand)Get(player, "PreviousCommand")!).Execute(null); Settle();
+            check(ReferenceEquals(Playing(), interrupted) && ReferenceEquals(Upcoming()[0], picked) && Upcoming().Skip(1).SequenceEqual(shuffle) && Active(),
+                "Previous returns to the song that was interrupted, not to the list's song above the picked one");
+            ((ICommand)Get(player, "NextCommand")!).Execute(null); Settle();
+            check(ReferenceEquals(Playing(), picked) && Upcoming().SequenceEqual(shuffle), "Next plays the picked song again, then the shuffle");
+
+            // The queue panel: Noctis drops the songs above the one clicked.
+            var target = shuffle[4];
+            playerType.GetMethod("PlayFromUpNextAt")!.Invoke(player, new object[] { 4 }); Settle();
+            check(ReferenceEquals(Playing(), target) && Upcoming().SequenceEqual(shuffle.Where(t => !ReferenceEquals(t, target))) && Active(),
+                "A song clicked in the queue plays now and the songs above it are kept");
+
+            // A song that is further down the shuffle, played from a list: it is not left in the queue to play twice.
+            shuffle = Upcoming();
+            var later = shuffle[6];
+            replace.Invoke(player, new object[] { songs, songs.IndexOf(later) }); Settle();
+            check(ReferenceEquals(Playing(), later) && Upcoming().SequenceEqual(shuffle.Where(t => !ReferenceEquals(t, later))), "A song already further down the shuffle plays now and is taken out of its old place");
+
+            // The history (or anything else that plays one song alone).
+            shuffle = Upcoming();
+            var single = songs.Cast<object>().First(t => !shuffle.Contains(t) && !ReferenceEquals(t, Playing()));
+            replace.Invoke(player, new object[] { One(single), 0 }); Settle();
+            check(ReferenceEquals(Playing(), single) && Upcoming().SequenceEqual(shuffle) && Active(), "A song played on its own (history, search) keeps the shuffle too");
+
+            // Double-clicking the song that is already playing restarts it and keeps the shuffle.
+            shuffle = Upcoming();
+            replace.Invoke(player, new object[] { songs, songs.IndexOf(Playing()) }); Settle();
+            check(ReferenceEquals(Playing(), single) && Upcoming().SequenceEqual(shuffle) && Active(), "Playing the song that is playing again keeps the shuffle");
+            check(host.Notices.Count(n => n.Contains("Playing it now")) == 1, "The notice is shown once, not for every song");
+
+            // The rolling queue goes on behind a played song.
+            var started = new List<object>();
+            for (int step = 0; step < 12; step++) { ((ICommand)Get(player, "NextCommand")!).Execute(null); Settle(); started.Add(Playing()); }
+            check(Active() && Upcoming().Length > 0 && Upcoming().Distinct().Count() == Upcoming().Length, "More shuffle is added behind as usual, with nothing queued twice");
+
+            // Clearing the queue is still the way to start over.
+            playerType.GetMethod("ClearQueue")!.Invoke(player, null); Settle();
+            check(!Active() && Upcoming().Length == 0 && host.Notices.Any(n => n.Contains("cleared or replaced")), "Clearing the queue still ends the session");
+            var free = songs.Cast<object>().First(t => !ReferenceEquals(t, Playing()));
+            replace.Invoke(player, new object[] { songs, songs.IndexOf(free) }); Settle();
+            check(ReferenceEquals(Playing(), free) && Upcoming().Length == songs.Count - songs.IndexOf(free) - 1, "Without a session, playing from a list is Noctis's own behaviour again");
+        }
+        finally
+        {
+            plugin.Shutdown();
+            if (player is IDisposable disposable) disposable.Dispose();
+        }
+    }
+
     private static object? Get(object o, string p) => o.GetType().GetProperty(p)!.GetValue(o);
     private static void Set(object o, string p, object v) => o.GetType().GetProperty(p)!.SetValue(o, v);
     private sealed class NativeShell

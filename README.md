@@ -1,5 +1,14 @@
 # True Shuffle for Noctis
 
+Version 1.3.0 keeps your shuffle when you play a song yourself. Normally Noctis makes the list a song was
+picked from the new queue (or, in the queue panel, drops every song above it), so one double-click threw
+the whole shuffle away. While True Shuffle is active, the song you play now starts at once and the
+shuffle that was upcoming stays behind it, in its order; if that song was further down the shuffle, it
+is taken out there so it does not play twice. This works from any list (songs, albums, playlists,
+artists, search, home), the queue panel and the history. Previous returns to the song you were
+listening to. To play a whole album or playlist instead, choose **End True Shuffle** on the shuffle
+button first (new in this version); clearing the queue also ends the session, as before.
+
 Version 1.2.0 keeps the music going. Apply queues the first 200 songs of the plan and adds the next
 200 whenever the upcoming queue is down to 20, so a cycle never ends with silence: the next cycle (or
 a fresh order, or the play counts again) follows, with the same mode and source. Only Never played
@@ -49,7 +58,8 @@ For manual installation, download
 3. Click Noctis's **shuffle button** to choose a mode. The first four choices shuffle the current
    queue; the **Open playlist** and **Whole library** submenus offer the same modes for those sources.
    Picking a mode applies it directly and keeps the current song playing. The active mode is checked
-   in the menu and named in the tooltip. **Noctis shuffle (normal)** keeps the original toggle available.
+   in the menu and named in the tooltip. **End True Shuffle** stops the custom session and keeps the queue;
+   **Noctis shuffle (normal)** keeps the original toggle available.
 4. For extra options, choose **More shuffle controls…**, or right-click a song → **True Shuffle…**.
    The full window offers **Apply shuffle**, keeping/restarting the current song, and resetting progress.
    You can also open that window from the plugin's settings.
@@ -99,8 +109,12 @@ Favorites and star ratings do not affect any mode.
   is used up the next one is made with the same mode and source: a fresh cycle for No repeats (without
   what is still upcoming), a new random order for Equal chance, the play counts again for Discovery.
   Never played only stops when none are left, with one notice, and plays out what is queued. A source
-  of a few songs simply goes round again. Clearing the upcoming queue in Noctis, or replacing it by
-  playing something else, ends the session (and the continuation), like the controls below.
+  of a few songs simply goes round again. Clearing the upcoming queue in Noctis ends the session (and the
+  continuation), like the controls below.
+- **Playing a song yourself keeps the shuffle.** A song you play from a list, the queue panel or the
+  history starts now and counts as heard; the upcoming shuffle stays behind it in its order, without a
+  second copy of that song. Previous goes back to the song that was interrupted. Track Radio still
+  ends the session. To hear a whole album or playlist, use **End True Shuffle** first.
 - **Return to Noctis controls**, changing native shuffle/repeat/radio/autoplay controls, or disabling
   the plugin ends the session. Prior Autoplay and Repeat values are restored unless you changed them.
   The arranged queue is kept, built-in Shuffle stays off unless you turn it on, and the old radio seed
