@@ -173,7 +173,7 @@ internal static class NativePlayerTests
         var folder = Path.Combine(Path.GetTempPath(), "shuffle-playnow-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(folder);
         var songs = (IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(trackType))!;
-        for (int i = 0; i < 30; i++)
+        for (int i = 0; i < 60; i++)
         {
             var track = Activator.CreateInstance(trackType)!;
             Set(track, "Id", Guid.NewGuid()); Set(track, "Title", "Library " + i); Set(track, "Artist", "Test artist");
@@ -209,7 +209,8 @@ internal static class NativePlayerTests
             replace.Invoke(player, new object[] { songs, 0 }); Dispatcher.UIThread.RunJobs();
             plugin.Initialize(host);
             Pump(() => ((Task)Field("_load")!).IsCompleted);
-            SetField("_bridge", new QueueBridge(new NativeShell(player, library), false)); SetField("_windowSize", 10); SetField("_refillAt", 3);
+            var shell = new NativeShell(player, library);
+            SetField("_bridge", new QueueBridge(shell, false)); SetField("_windowSize", 10); SetField("_refillAt", 3);
             var apply = (Task)typeof(TrueShufflePlugin).GetMethod("ApplyAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
                 .Invoke(plugin, new object[] { ShuffleMode.NoRepeats, "Whole library", true, false })!;
             Pump(() => apply.IsCompleted); Settle();
@@ -259,6 +260,64 @@ internal static class NativePlayerTests
             for (int step = 0; step < 12; step++) { ((ICommand)Get(player, "NextCommand")!).Execute(null); Settle(); started.Add(Playing()); }
             check(Active() && Upcoming().Length > 0 && Upcoming().Distinct().Count() == Upcoming().Length, "More shuffle is added behind as usual, with nothing queued twice");
 
+            // The user's own songs: Add to Queue keeps the order they were added in, ahead of the shuffle; Play Next goes first.
+            object Call(string name, params object[] given)
+            {
+                var method = playerType.GetMethods().Where(m => m.Name == name && m.GetParameters().Length >= given.Length
+                    && m.GetParameters().Skip(given.Length).All(x => x.IsOptional)).OrderBy(m => m.GetParameters().Length).First();
+                return method.Invoke(player, given.Concat(method.GetParameters().Skip(given.Length).Select(x => x.DefaultValue)).ToArray())!;
+            }
+            List<object> Mine() => (List<object>)Field("_priority")!.GetType().GetMethod("Manual")!.Invoke(Field("_priority"), new object[] { Upcoming() })!;
+            shuffle = Upcoming();
+            var outside = songs.Cast<object>().Where(t => !shuffle.Contains(t) && !ReferenceEquals(t, Playing())).ToArray();
+            Call("AddToQueue", outside[0]); Settle();
+            Call("AddToQueue", outside[1]); Settle();
+            check(ReferenceEquals(Upcoming()[0], outside[0]) && ReferenceEquals(Upcoming()[1], outside[1]) && Upcoming().Skip(2).SequenceEqual(shuffle),
+                "Songs added to the queue wait ahead of the shuffle in the order they were added");
+            // Play Next on a song heard a moment ago (it is in Noctis's history): still the user's own song.
+            outside[2] = ((IEnumerable)Get(player, "History")!).Cast<object>().First(t => !Upcoming().Contains(t) && !ReferenceEquals(t, Playing()) && !outside.Take(2).Contains(t));
+            Call("AddNext", outside[2]); Settle();
+            check(ReferenceEquals(Upcoming()[0], outside[2]) && Mine().SequenceEqual(new[] { outside[2], outside[0], outside[1] }) && Active(),
+                "Play Next goes first, and all three count as the user's own songs");
+
+            // Another playlist: a song played from it plays now, that playlist is shuffled from now on, the user's songs stay first.
+            var playlist = (IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(trackType))!;
+            var keys = new QueueBridge(shell, false);
+            var heardSoFar = (HashSet<string>)Field("_seen")!;
+            foreach (var track in songs.Cast<object>().Where(t => !outside.Take(3).Contains(t) && !ReferenceEquals(t, Playing()) && !heardSoFar.Contains(keys.Entry(t).Song.Key)).Take(8))
+                playlist.Add(track);
+            var fromPlaylist = playlist[2]!;
+            replace.Invoke(player, new object[] { playlist, 2 }); Settle();
+            var members = playlist.Cast<object>().Where(t => !ReferenceEquals(t, fromPlaylist)).ToHashSet();
+            var queue = Upcoming();
+            check(ReferenceEquals(Playing(), fromPlaylist) && queue.Take(3).SequenceEqual(new[] { outside[2], outside[0], outside[1] }), "Switching playlists keeps the user's songs first, in their order");
+            check(queue.Skip(3).ToHashSet().SetEquals(members) && queue.Length == 3 + members.Count && Active(), "... followed by the whole other playlist, and nothing from the old shuffle");
+            check(host.Notices.Count(n => n.Contains("Now shuffling the list you played from")) == 1, "The switch is explained once");
+            var heardBefore = ((HashSet<string>)Field("_seen")!).Count;
+            // Within that playlist again: it is the same list now, so the shuffle stays.
+            queue = Upcoming();
+            var again = queue[5];
+            replace.Invoke(player, new object[] { playlist, playlist.IndexOf(again) }); Settle();
+            check(ReferenceEquals(Playing(), again) && Upcoming().SequenceEqual(queue.Where(t => !ReferenceEquals(t, again))), "A song from the playlist being shuffled plays now and keeps that shuffle");
+            check(((HashSet<string>)Field("_seen")!).Count > heardBefore, "... and counts as heard");
+            // The playlist runs out and goes round again; the user's songs play first; nothing from outside the playlist comes back.
+            var played = new List<object>();
+            for (int step = 0; step < 14; step++) { ((ICommand)Get(player, "NextCommand")!).Execute(null); Settle(); played.Add(Playing()); }
+            check(played.Take(3).SequenceEqual(new[] { outside[2], outside[0], outside[1] }) && played.Skip(3).All(t => playlist.Contains(t)) && Active() && Upcoming().Length > 0,
+                "The user's songs play first, then only that playlist, round again when it runs out");
+            check(Mine().Count == 0, "Songs of the user's that have played are no longer kept ahead");
+
+            // The Songs page (here with a search that shows three songs): the whole library is shuffled again.
+            Call("AddToQueue", outside[3]); Settle();
+            shell.CurrentView = new Noctis.ViewModels.LibrarySongsViewModel();
+            var searched = (IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(trackType))!;
+            foreach (var track in songs.Cast<object>().Where(t => !playlist.Contains(t) && !ReferenceEquals(t, outside[3])).Take(3)) searched.Add(track);
+            replace.Invoke(player, new object[] { searched, 1 }); Settle();
+            queue = Upcoming();
+            check(ReferenceEquals(Playing(), searched[1]) && ReferenceEquals(queue[0], outside[3]) && queue.Length == 11 && queue.Skip(1).Any(t => !playlist.Contains(t) && !searched.Contains(t)),
+                "A song from the Songs page switches back to the whole library, with the user's song still first");
+            shell.CurrentView = null;
+
             // Clearing the queue is still the way to start over.
             playerType.GetMethod("ClearQueue")!.Invoke(player, null); Settle();
             check(!Active() && Upcoming().Length == 0 && host.Notices.Any(n => n.Contains("cleared or replaced")), "Clearing the queue still ends the session");
@@ -280,6 +339,7 @@ internal static class NativePlayerTests
         private readonly object _library;
         public object Library => _library;
         public object Player { get; } public FakeSettings Settings { get; } = new();
+        public object? CurrentView { get; set; }
         public NativeShell(object player, object library) { Player = player; _library = library; }
     }
 }
@@ -316,4 +376,10 @@ public class ServiceStub : DispatchProxy
         return null;
     }
     public void Raise(string name) { if (_events.TryGetValue(name, out var handler)) handler?.DynamicInvoke(this, EventArgs.Empty); }
+}
+
+namespace Noctis.ViewModels
+{
+    /// <summary>Stands for Noctis's Songs page: the plugin knows that page by this name.</summary>
+    internal sealed class LibrarySongsViewModel { }
 }

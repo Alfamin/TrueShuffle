@@ -1,5 +1,16 @@
 # True Shuffle for Noctis
 
+Version 1.4.0 works like two queues, the way Spotify does. Songs you add yourself (**Add to Queue**, **Play
+Next**) are your queue: they wait ahead of the shuffle, in the order you added them, and stay there
+whatever the shuffle does. Behind them is the shuffle of what you are listening to. Play a song from
+another playlist, album, artist or the Songs page while True Shuffle is on, and that list becomes what is
+shuffled, in the same mode: the song plays now, your own songs still come first, and the old shuffle goes.
+Play a song from the list you are already shuffling (a search inside it included), from the queue panel or
+from the history, and the shuffle stays as it was (1.3.0). The Songs page counts as the whole library,
+whatever its search box shows. A Play button on an album or playlist works the same way: its first song
+plays, then that album or playlist shuffled. To hear a list in its own order, choose **End True Shuffle**
+first. Before, a song added with Add to Queue went in front of the songs you had added earlier.
+
 Version 1.3.0 keeps your shuffle when you play a song yourself. Normally Noctis makes the list a song was
 picked from the new queue (or, in the queue panel, drops every song above it), so one double-click threw
 the whole shuffle away. While True Shuffle is active, the song you play now starts at once and the
@@ -111,10 +122,14 @@ Favorites and star ratings do not affect any mode.
   Never played only stops when none are left, with one notice, and plays out what is queued. A source
   of a few songs simply goes round again. Clearing the upcoming queue in Noctis ends the session (and the
   continuation), like the controls below.
-- **Playing a song yourself keeps the shuffle.** A song you play from a list, the queue panel or the
-  history starts now and counts as heard; the upcoming shuffle stays behind it in its order, without a
-  second copy of that song. Previous goes back to the song that was interrupted. Track Radio still
-  ends the session. To hear a whole album or playlist, use **End True Shuffle** first.
+- **Your queue and the shuffle.** Songs you add with Add to Queue or Play Next wait ahead of the shuffle
+  (Add to Queue in the order you added them, Play Next first) and are kept when the shuffle changes.
+- **Playing a song yourself.** It starts now and counts as heard. From the list being shuffled (or part of
+  it), the queue panel or the history, the upcoming shuffle stays behind it in its order, without a second
+  copy of that song. From another playlist, album, artist, folder or the Songs page, that list is shuffled
+  from now on with the same mode (No repeats leaves out what you have heard, until that list is used up),
+  behind your own songs. Previous goes back to the song that was interrupted. Track Radio still ends the
+  session. To hear a whole album or playlist in order, use **End True Shuffle** first.
 - **Return to Noctis controls**, changing native shuffle/repeat/radio/autoplay controls, or disabling
   the plugin ends the session. Prior Autoplay and Repeat values are restored unless you changed them.
   The arranged queue is kept, built-in Shuffle stays off unless you turn it on, and the old radio seed

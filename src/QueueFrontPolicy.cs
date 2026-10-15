@@ -8,7 +8,10 @@ using Avalonia.Threading;
 
 namespace TrueShuffle;
 
-/// <summary>Manual appends take priority over the prepared shuffle; native methods retain queue bookkeeping.</summary>
+/// <summary>
+/// Songs the user puts in the queue (Add to Queue, Play Next) are theirs: they go ahead of the prepared shuffle, in the order
+/// they were added, and stay there when the shuffle behind them changes. Native methods retain queue bookkeeping.
+/// </summary>
 public sealed class QueueFrontPolicy : IDisposable
 {
     private readonly object _player;
@@ -27,6 +30,11 @@ public sealed class QueueFrontPolicy : IDisposable
     private object[]? _replacedFrom;
     private object? _playingBefore;
     private bool _historyPushed, _pushedBefore, _freshRows;
+    // The user's own songs that are upcoming. A row taken out during the current call is remembered until the call is over,
+    // so that a row moved within the queue keeps what it was.
+    private readonly HashSet<object> _manual = new(ReferenceEqualityComparer.Instance);
+    private readonly Dictionary<object, bool> _lifted = new(ReferenceEqualityComparer.Instance);
+    private readonly List<(object Row, object? Playing)> _inserted = new(); // with the song that was playing when it came in
     /// <param name="replaced">Called (later, on the UI thread) when the user cleared the upcoming queue or replaced it with other songs.</param>
     /// <param name="played">Called instead of <paramref name="replaced"/> when the replacement started a song (the user played it from a
     /// list, the queue panel or the history), with the songs that were upcoming until then.</param>
@@ -49,6 +57,13 @@ public sealed class QueueFrontPolicy : IDisposable
     /// starts in between is the one the user picked, not the end of the session.
     /// </summary>
     public bool Replacing=>_replacedFrom!=null;
+
+    /// <summary>The songs among <paramref name="rows"/> that the user put in the queue themselves, in the order given.</summary>
+    public List<object> Manual(IEnumerable<object> rows)
+    {
+        var seen=new HashSet<object>(ReferenceEqualityComparer.Instance);
+        return rows.Where(row=>_manual.Contains(row) && seen.Add(row)).ToList();
+    }
 
     private object[] Snapshot()=>_queue.Cast<object>().ToArray();
 
@@ -88,7 +103,9 @@ public sealed class QueueFrontPolicy : IDisposable
             }
             else
             {
-                _pending.Clear(); // later user edits/removals win; never resurrect a removed row
+                var present=new HashSet<object>(after,ReferenceEqualityComparer.Instance);
+                _pending.RemoveAll(row=>!present.Contains(row)); // never resurrect a removed row
+                bool captured=false;
                 // The real player announces a cleared queue, a replaced queue and a bulk addition alike
                 // as Reset; an addition keeps the old rows as its prefix (handled above). A Reset that
                 // leaves nothing, or brings songs that were not upcoming, is the user starting over.
@@ -101,10 +118,12 @@ public sealed class QueueFrontPolicy : IDisposable
                         // Whether this started a song is only known once Noctis is done with it.
                         _replacedFrom=_before; _playingBefore=QueueBridge.Get(_player,"CurrentTrack"); _pushedBefore=pushed; _freshRows=fresh;
                         Dispatcher.UIThread.Post(Settle,DispatcherPriority.Normal);
+                        captured=true;
                     }
                     else if (_replaced!=null && _before.Length>0 && fresh)
                         Dispatcher.UIThread.Post(()=>{ if (!_disposed) _replaced(); },DispatcherPriority.Input);
                 }
+                if (!captured && _replacedFrom==null) Track(after,present);
             }
         }
         _before=after;
@@ -113,6 +132,32 @@ public sealed class QueueFrontPolicy : IDisposable
         {
             Dispose();
             _error("Requested-song priority stopped: "+ex.GetBaseException().Message+". Existing playback and queue were kept.");
+        }
+    }
+
+    /// <summary>
+    /// Which songs are the user's: one that left the queue (it started, or was removed) is no longer theirs, unless it comes
+    /// back in the same call (a move). A song that comes in is theirs (Play Next), except the playing song going back in
+    /// front (Previous) and songs that come in as another one starts (a jump back through the history); that is told once
+    /// the call is over, in <see cref="Promote"/>.
+    /// </summary>
+    private void Track(object[] after, HashSet<object> present)
+    {
+        var was=new HashSet<object>(_before,ReferenceEqualityComparer.Instance);
+        foreach (var row in was)
+            if (!present.Contains(row))
+            {
+                if (_lifted.Count==0) Dispatcher.UIThread.Post(()=>_lifted.Clear(),DispatcherPriority.Send);
+                _lifted[row]=_manual.Remove(row);
+            }
+        var playing=QueueBridge.Get(_player,"CurrentTrack");
+        foreach (var row in after)
+        {
+            if (was.Contains(row)) continue;
+            if (_lifted.Remove(row,out var mine)) { if (mine) _manual.Add(row); continue; }
+            if (ReferenceEquals(row,playing)) continue;
+            _inserted.Add((row,playing));
+            if (!_posted) { _posted=true; Dispatcher.UIThread.Post(Promote,DispatcherPriority.Input); }
         }
     }
 
@@ -149,11 +194,24 @@ public sealed class QueueFrontPolicy : IDisposable
         _posted=false;
         if (_disposed) return;
         var requested=_pending.ToArray();_pending.Clear();
-        if (requested.Length==0) return;
+        var inserted=_inserted.ToArray();_inserted.Clear();
+        if (requested.Length==0 && inserted.Length==0) return;
         _editing=true;
         try
         {
+            // A song put in with Play Next stays where Noctis put it; only another copy further down goes.
             var promoted=new List<object>();
+            var playingNow=QueueBridge.Get(_player,"CurrentTrack");
+            foreach (var (row,playing) in inserted)
+            {
+                if (!ReferenceEquals(playing,playingNow)) continue; // came in as another song started: Noctis moving through its history
+                var snapshot=Snapshot();
+                int first=Array.FindIndex(snapshot,track=>ReferenceEquals(track,row));
+                if (first<0 || promoted.Contains(row)) continue;
+                for (int i=snapshot.Length-1;i>first;i--) if (Same(snapshot[i],row)) _remove.Invoke(_player,new object[]{i});
+                _manual.Add(row);
+                promoted.Add(row);
+            }
             foreach (var request in requested)
             {
                 if (promoted.Any(track=>Same(track,request))) continue;
@@ -163,10 +221,14 @@ public sealed class QueueFrontPolicy : IDisposable
                 // Retain the newly requested row, remove its older upcoming duplicates only.
                 var kept=matches[^1].track;
                 foreach (var row in matches.Take(matches.Length-1).Reverse()) _remove.Invoke(_player,new object[]{row.i});
-                int from=Array.FindLastIndex(Snapshot(),track=>ReferenceEquals(track,kept));
+                var now=Snapshot();
+                int from=Array.FindLastIndex(now,track=>ReferenceEquals(track,kept));
                 if (from<0) continue;
-                int to=promoted.Count;
+                // Behind the user's songs that already wait at the front, ahead of the shuffle.
+                int to=0;
+                while (to<now.Length && to!=from && _manual.Contains(now[to])) to++;
                 if (from!=to) _move.Invoke(_player,new object[]{from,to});
+                _manual.Add(kept);
                 promoted.Add(kept);
             }
             if (promoted.Count>0) _admit(promoted);
@@ -179,12 +241,16 @@ public sealed class QueueFrontPolicy : IDisposable
     {
         var was=_editing; _editing=true;
         try { change(); }
-        finally { _editing=was; _before=Snapshot(); }
+        finally
+        {
+            _editing=was; _before=Snapshot();
+            if (_replacedFrom==null) _manual.IntersectWith(_before); // a song of the user's that the change left out has played or gone
+        }
     }
     public void Dispose()
     {
         if (_disposed) return;
-        _disposed=true; _pending.Clear();_replacedFrom=null;_events.CollectionChanged-=Changed;
+        _disposed=true; _pending.Clear();_inserted.Clear();_manual.Clear();_replacedFrom=null;_events.CollectionChanged-=Changed;
         if (_history!=null) _history.CollectionChanged-=HistoryChanged;
     }
 }

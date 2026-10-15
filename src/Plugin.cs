@@ -15,7 +15,7 @@ namespace TrueShuffle;
 
 public sealed class TrueShufflePlugin : INoctisPlugin
 {
-    public PluginInfo Info { get; } = new("dev.moshi.trueshuffle", "True Shuffle", "1.3.0", "moshi",
+    public PluginInfo Info { get; } = new("dev.moshi.trueshuffle", "True Shuffle", "1.4.0", "moshi",
         "Equal-chance shuffle, persistent no-repeat cycles, and discovery modes for your queue, playlist or library.");
     private IPluginHost? _host;
     private IDisposable? _command;
@@ -32,7 +32,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
     private HashSet<string> _session = new(StringComparer.Ordinal);
     private string? _last, _lastPath, _historyError;
     private bool _closed, _busy, _ownChange;
-    private bool _toldPlayNow; // the notice that explains a song played from a list is shown once per run
+    private bool _toldPlayNow, _toldSwitch; // the notices that explain a song played from a list are shown once per run
     private volatile bool _saveFailing; // the last attempt to save progress failed (history that could not be LOADED is _historyError)
     private int _epoch, _pending, _historyVersion; // _historyVersion changes whenever the remembered history is replaced or reset
     private string? _buttonError;
@@ -49,7 +49,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
         _host = host;
         _closed = false;
         _busy = false;
-        _seen = new(StringComparer.Ordinal); _last = null; _lastPath = null; _historyError = null; _saveFailing = false; _toldPlayNow = false;
+        _seen = new(StringComparer.Ordinal); _last = null; _lastPath = null; _historyError = null; _saveFailing = false; _toldPlayNow = false; _toldSwitch = false;
         int epoch = ++_epoch;
         _store = new CycleStore(host.DataDirectory);
         _load = LoadAsync(_store, epoch);
@@ -230,7 +230,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
                             var song=bridge.Entry(track).Song;
                             _session.Add(song.Key);_session.Add(song.LegacyKey);
                         }
-                        Notice($"{requested.Count} song{(requested.Count==1 ? "" : "s")} added next, ahead of the shuffle.");
+                        Notice($"{requested.Count} song{(requested.Count==1 ? "" : "s")} queued ahead of the shuffle.");
                     },Notice,OnQueueReplaced,OnPlayedNow);
                 _roll = new RollingQueue(mode, scope, skipDisliked, scope == "Whole library" ? null : raw, ordered, first.Count, prepared.identities);
             }
@@ -383,33 +383,152 @@ public sealed class TrueShufflePlugin : INoctisPlugin
 
     /// <summary>
     /// Noctis plays a song by making the list it was picked from the new queue (the queue panel drops the songs above it, the
-    /// history plays it alone). During a session the song plays now and the shuffle that was upcoming stays behind it, in its
-    /// order; a copy of the song further down is taken out so it does not play twice.
+    /// history plays it alone). During a session the song plays now, and the songs the user queued themselves stay first.
+    /// Picked from what is being shuffled (or from the queue, the history, or alone), the shuffle that was upcoming stays
+    /// behind it, in its order, without a second copy of that song. Picked from another playlist, album, artist or the Songs
+    /// page, that list is shuffled from now on, in the same mode (<see cref="SwitchAsync"/>).
     /// </summary>
     private void OnPlayedNow(IReadOnlyList<object> before)
     {
-        if (_closed || _lease == null || _bridge == null || _priority == null) return;
-        var bridge = _bridge; var policy = _priority;
+        if (_closed || _lease == null || _bridge == null || _priority == null || _roll == null) return;
+        var bridge = _bridge; var policy = _priority; var roll = _roll;
         try
         {
             var playing = QueueBridge.Get(bridge.Player, "CurrentTrack");
-            var keep = before.Where(track => playing == null || !QueueFrontPolicy.Same(track, playing)).ToList();
-            policy.Own(() => bridge.ReplaceUpcoming(keep));
+            bool NotPlaying(object track) => playing == null || !QueueFrontPolicy.Same(track, playing);
+            var list = bridge.PlayedList(); // before ReplaceUpcoming, which forgets the songs above the picked one
+            var next = Context(roll, before, playing, list, bridge);
+            if (next == null) policy.Own(() => bridge.ReplaceUpcoming(before.Where(NotPlaying).ToList()));
+            else
+            {
+                // Until the new shuffle is ready: the user's songs, then the rest of that list as Noctis queued it.
+                var mine = policy.Manual(before).Where(NotPlaying).ToList();
+                var rest = bridge.Upcoming().Select(t => t.Native).Where(t => !mine.Contains(t, ReferenceEqualityComparer.Instance));
+                policy.Own(() => bridge.ReplaceUpcoming(mine.Concat(rest).ToList()));
+                foreach (var track in list) _session.Add(bridge.Raw(track).LegacyKey); // a song of that list that starts meanwhile is not the end of the session
+                roll.Finished = true;
+                next.Busy = true;
+                _roll = next;
+                _refill = SwitchAsync(next, _epoch);
+            }
             var song = bridge.Current?.Song;
             if (song != null) { _session.Add(song.Key); _session.Add(song.LegacyKey); }
             MarkCurrent();
-            if (!_toldPlayNow)
+            if (next == null)
             {
-                _toldPlayNow = true;
-                Notice("Playing it now; your shuffle continues after it. To play a whole album or playlist instead, choose End True Shuffle on the shuffle button first.");
+                if (!_toldPlayNow)
+                {
+                    _toldPlayNow = true;
+                    Notice("Playing it now; your shuffle continues after it. Songs from another playlist, album or artist switch the shuffle to that list.");
+                }
+                WatchQueue();
             }
-            WatchQueue();
         }
         catch (Exception ex)
         {
             EndSession();
             Notice("True Shuffle session ended: the shuffle could not be kept behind the song you played (" + ex.GetBaseException().Message + ").");
         }
+    }
+
+    /// <summary>
+    /// Where the song was picked: null when that is what is being shuffled already, or the queue, the history, or a song on
+    /// its own; otherwise the new context to shuffle, whose <see cref="RollingQueue.Members"/> is null for the whole library.
+    /// </summary>
+    private RollingQueue? Context(RollingQueue roll, IReadOnlyList<object> before, object? playing, List<object> list, QueueBridge bridge)
+    {
+        if (list.Count <= 1) return null;
+        var earlier = new HashSet<object>(before, ReferenceEqualityComparer.Instance);
+        if (list.All(track => earlier.Contains(track) || ReferenceEquals(track, playing))) return null; // the queue panel: a song of the upcoming queue
+        var library = bridge.SnapshotRaw("Whole library").Select(t => t.Id).ToHashSet(StringComparer.Ordinal);
+        bool MostOf(IEnumerable<string> ids, ICollection<string> of, double share) => of.Count > 0 && ids.Count(of.Contains) >= share * of.Count;
+        RollingQueue New(IReadOnlyList<RawTrack>? members) => new(roll.Mode, members == null ? "Whole library" : "Current queue", roll.SkipDisliked, members,
+            new List<TrackEntry>(), 0, roll.Busy ? new(StringComparer.Ordinal) : new(roll.Identities, StringComparer.Ordinal));
+        var shuffled = roll.Members?.Select(t => t.Id).ToHashSet(StringComparer.Ordinal);
+        // The Songs page is the whole library, whatever its search box shows.
+        if (bridge.SongsPageOpen)
+            return shuffled == null || MostOf(shuffled, library, 0.95) ? null : New(null);
+        var raw = list.Select(bridge.Raw).ToList();
+        var ids = raw.Select(t => t.Id).Distinct(StringComparer.Ordinal).ToList();
+        if (shuffled == null) return MostOf(ids, library, 0.95) ? null : New(raw);
+        // Part of the list being shuffled (a search inside it, say) is the same list.
+        return ids.Count(shuffled.Contains) >= 0.9 * ids.Count ? null : New(raw);
+    }
+
+    /// <summary>
+    /// A song was played from another playlist, album, artist or the Songs page: that list is shuffled from now on, in the
+    /// same mode, behind the playing song and the user's own queued songs. The old shuffle is dropped.
+    /// </summary>
+    private async Task SwitchAsync(RollingQueue roll, int epoch)
+    {
+        var bridge = _bridge!; var lease = _lease;
+        bool Current() => !_closed && epoch == _epoch && ReferenceEquals(_roll, roll) && ReferenceEquals(lease, _lease) && ReferenceEquals(bridge, _bridge);
+        try
+        {
+            var current = bridge.CurrentRaw;
+            IReadOnlyList<RawTrack> source = roll.Members ?? bridge.SnapshotRaw("Whole library");
+            var upcoming = bridge.Upcoming();
+            var mine = _priority?.Manual(upcoming.Select(t => t.Native)) ?? new List<object>();
+            var mineRaw = upcoming.Where(t => mine.Contains(t.Native, ReferenceEqualityComparer.Instance)).ToList();
+            bool explicitAllowed = bridge.ExplicitAllowed; var mode = roll.Mode; bool skipDisliked = roll.SkipDisliked;
+            var known = _seen.ToArray(); var last = _last;
+            var identities = roll.Identities;
+            var planned = await Task.Run(() =>
+            {
+                var entries = source.Select(r => r.Entry(identities)).ToList();
+                var waiting = mineRaw.Select(r => r.Entry(identities).Song.Key).ToHashSet(StringComparer.Ordinal);
+                var playing = current?.Entry(identities).Song.Key;
+                var remembered = playing != null ? known.Append(playing).ToArray() : known;
+                var built = ShuffleEngine.Build(entries.Select(e => e.Song)
+                    .Where(s => s.Remote || (!string.IsNullOrWhiteSpace(s.Path) && File.Exists(s.Path))),
+                    mode, remembered, playing, last, explicitAllowed, skipDisliked, upcoming: waiting);
+                var native = entries.DistinctBy(e => e.Song.Key).ToDictionary(e => e.Song.Key);
+                var queue = built.Songs.Select(s => native[s.Key]).ToList();
+                var keys = queue.SelectMany(e => new[] { e.Song.Key, e.Song.LegacyKey }).ToHashSet(StringComparer.Ordinal);
+                return (plan: built, ordered: queue, session: keys);
+            });
+            if (!Current()) return; // ended, applied again, or another song was played from another list meanwhile
+            if (planned.plan.Songs.Count == 0)
+            {
+                EndSession();
+                Notice(mode == ShuffleMode.NeverPlayed
+                    ? "True Shuffle ended: the list you played from has no never-played songs left. It plays on in its own order."
+                    : "True Shuffle ended: the list you played from has nothing else to shuffle. It plays on in its own order.");
+                return;
+            }
+            var kept = planned.plan.Seen as ISet<string> ?? planned.plan.Seen.ToHashSet(StringComparer.Ordinal);
+            _seen.ExceptWith(known.Where(k => !kept.Contains(k)));
+            _seen.UnionWith(planned.plan.Seen);
+            if (planned.plan.NewCycle) QueueSave();
+            _session.UnionWith(planned.session);
+            var playingNow = bridge.CurrentRaw?.Id;
+            roll.Plan = planned.ordered.Where(e => e.Song.Id != playingNow).ToList();
+            var first = roll.Plan.Take(_windowSize).ToList();
+            roll.Next = first.Count;
+            // The user's songs as they are now (one may have been added meanwhile), then the new shuffle.
+            var policy = _priority;
+            var ownNow = policy?.Manual(bridge.Upcoming().Select(t => t.Native)) ?? new List<object>();
+            var queueNow = ownNow.Concat(first.Select(e => e.Native).Where(t => !ownNow.Contains(t, ReferenceEqualityComparer.Instance))).ToList();
+            void Put() => bridge.ReplaceUpcoming(queueNow);
+            if (policy != null) policy.Own(Put); else Put();
+            _buttons?.Selected(mode, roll.Scope);
+            if (!_toldSwitch)
+            {
+                _toldSwitch = true;
+                Notice("Now shuffling the list you played from, in the same mode. Songs you queued yourself stay first. To play a list in its own order, choose End True Shuffle on the shuffle button first.");
+            }
+        }
+        catch (Exception ex)
+        {
+            if (Current())
+            {
+                EndSession();
+                Notice("True Shuffle session ended: the list you played from could not be shuffled (" + ex.GetBaseException().Message + "). It plays on in its own order.");
+            }
+            return;
+        }
+        finally { roll.Busy = false; }
+        WatchQueue();
     }
 
     /// <summary>The shuffle button's End True Shuffle: the queue stays as it is and Noctis's own controls are back.</summary>

@@ -30,6 +30,8 @@ public sealed record RawTrack(object Native, string Id, string Path, string Titl
         }
         return new(Native, new Song(Id, Path, Title, Artist, PlayCount, Skip, Explicit, Disliked, SnoozedUntil, Remote, key));
     }
+    /// <summary>The path-based key (<see cref="Song.LegacyKey"/>), worked out without opening the file.</summary>
+    public string LegacyKey => new Song(Id, Path, Title, Artist, PlayCount, Skip, Explicit, Disliked, SnoozedUntil, Remote).LegacyKey;
 }
 
 /// <summary>
@@ -118,6 +120,26 @@ public sealed class QueueBridge
         if (Player.GetType().GetField("_precedingInQueue", BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(Player) is IList preceding
             && preceding.GetType().IsGenericType && preceding.GetType().GetGenericArguments()[0] == _trackType) preceding.Clear();
     }
+
+    /// <summary>
+    /// The whole list Noctis was last asked to play from: the songs above the one picked (Noctis keeps them for Previous),
+    /// the playing song and what is upcoming. Read it before <see cref="ReplaceUpcoming"/>, which forgets the songs above.
+    /// </summary>
+    public List<object> PlayedList()
+    {
+        var list = new List<object>();
+        if (Player.GetType().GetField("_precedingInQueue", BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(Player) is IEnumerable preceding)
+            list.AddRange(preceding.Cast<object>().Where(_trackType.IsInstanceOfType));
+        if (Get(Player, "CurrentTrack") is object current) list.Add(current);
+        list.AddRange(((IEnumerable)Get(Player, "UpNext")!).Cast<object>());
+        return list;
+    }
+
+    /// <summary>The Songs page (the whole library, maybe filtered by a search) is the page open in Noctis.</summary>
+    public bool SongsPageOpen => Get(_main, "CurrentView")?.GetType().FullName == "Noctis.ViewModels.LibrarySongsViewModel";
+
+    /// <summary>What a native track says about itself; no file is opened.</summary>
+    public RawTrack Raw(object native) => Read(native);
 
     public TrackEntry Entry(object native)=>Wrap(native);
     public bool ExplicitAllowed => Get(_main, "Settings") is object s ? (bool)(Get(s, "AllowExplicitContent") ?? throw Changed()) : throw Changed();
