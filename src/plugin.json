@@ -1,7 +1,7 @@
 {
   "id": "dev.moshi.trueshuffle",
   "name": "True Shuffle",
-  "version": "1.4.2",
+  "version": "1.5.0",
   "author": "moshi",
   "description": "Choose equal-chance, no-repeat and discovery modes directly from the shuffle button. Supports the current queue, open playlist or whole library; changes playback only when you choose a mode or apply it.",
   "type": "dotnet",
@@ -14,7 +14,8 @@
   "settings": [
     {"key":"shortcut","label":"Shuffle shortcut","type":"string","default":"Follow Noctis","description":"Follow Noctis opens these modes with its Shuffle key (Ctrl+S by default), including keys changed in Settings. Enter another modified key, or off for native keyboard shuffle. No music or queue changes until you choose a mode."},
     {"key":"open","label":"Open shuffle controls","type":"bool","default":false,"description":"Flip this switch to open the shuffle window. You can also right-click any song → True Shuffle…. Opening the window does not change playback."},
-    {"key":"mode","label":"Default mode","type":"choice","default":"No repeats","choices":["Equal chance","No repeats","Discovery","Never played only"]},
+    {"key":"mode","label":"Default mode","type":"choice","default":"No repeats","choices":["Equal chance","No repeats","Discovery","Never played only","For you"]},
+    {"key":"forYouDiscovery","label":"For you: new songs","type":"choice","default":"Balanced","choices":["Familiar","Balanced","Adventurous"],"description":"How many songs you have not heard yet For you mixes in: about one in ten, one in five, or one in three."},
     {"key":"scope","label":"Default source","type":"choice","default":"Current queue","choices":["Current queue","Open playlist","Whole library"]},
     {"key":"skipDisliked","label":"Exclude disliked songs by default","type":"bool","default":false,"description":"Off: disliked songs have the same chance as other eligible songs. On: exclude them from all modes."}
   ]

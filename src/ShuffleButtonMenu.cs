@@ -123,7 +123,8 @@ public sealed class ShuffleButtonMenu : IDisposable
         { yield return item; foreach (var child in Items(item)) yield return child; }
     }
     private static string Label(ShuffleMode mode) => mode switch
-    { ShuffleMode.EqualChance => "Equal chance", ShuffleMode.NoRepeats => "No repeats", ShuffleMode.Discovery => "Discovery", _ => "Never played only" };
+    { ShuffleMode.EqualChance => "Equal chance", ShuffleMode.NoRepeats => "No repeats", ShuffleMode.Discovery => "Discovery",
+      ShuffleMode.ForYou => "For you", _ => "Never played only" };
     private sealed record Selection(ShuffleMode Mode, string Scope);
 
     public void Dispose() { foreach (var a in _buttons.Values) a.Dispose(); _buttons.Clear(); }

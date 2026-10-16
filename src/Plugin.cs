@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
 using System.Linq;
+using System.Text.Json;
 using System.Threading.Tasks;
 using System.Windows.Input;
 using Avalonia;
@@ -15,8 +16,8 @@ namespace TrueShuffle;
 
 public sealed class TrueShufflePlugin : INoctisPlugin
 {
-    public PluginInfo Info { get; } = new("dev.moshi.trueshuffle", "True Shuffle", "1.4.2", "moshi",
-        "Equal-chance shuffle, persistent no-repeat cycles, and discovery modes for your queue, playlist or library.");
+    public PluginInfo Info { get; } = new("dev.moshi.trueshuffle", "True Shuffle", "1.5.0", "moshi",
+        "Equal-chance shuffle, persistent no-repeat cycles, discovery modes and For you picks for your queue, playlist or library.");
     private IPluginHost? _host;
     private IDisposable? _command;
     private ShuffleShortcut? _shortcut;
@@ -44,6 +45,22 @@ public sealed class TrueShufflePlugin : INoctisPlugin
     private Task _refill = Task.CompletedTask;
     private Task _apply = Task.CompletedTask;
     private int _windowSize = 200, _refillAt = 20;
+    // For you plans a short window at a time, so that what is skipped or finished changes the next picks.
+    private const int ForYouWindow = 25, ForYouRefillAt = 6;
+
+    // ── listening log: what was played, how much of it was heard, and how it ended (listens.jsonl) ──
+    private ListenStore? _listens;
+    private readonly PlayTracker _tracker = new();
+    private List<PlayRecord> _plays = new();
+    private Task _listenLoad = Task.CompletedTask;
+    private DispatcherTimer? _listenTimer;
+    private object? _playing; // the native track the tracker follows
+    private readonly List<(string Id, DateTime At)> _started = new(); // every song start, heard or not: For you rests them
+    private System.Collections.Specialized.INotifyCollectionChanged? _queueWatch;
+    private bool _queueReset, _listenFailing;
+    private readonly System.Diagnostics.Stopwatch _clock = System.Diagnostics.Stopwatch.StartNew();
+    private Func<TimeSpan>? _testClock = null; // tests drive time themselves (set by reflection)
+    private TimeSpan Clock => _testClock?.Invoke() ?? _clock.Elapsed;
 
     public void Initialize(IPluginHost host)
     {
@@ -54,6 +71,11 @@ public sealed class TrueShufflePlugin : INoctisPlugin
         int epoch = ++_epoch;
         _store = new CycleStore(host.DataDirectory);
         _load = LoadAsync(_store, epoch);
+        _plays = new(); _playing = null; _listenFailing = false; _started.Clear();
+        _listens = new ListenStore(host.DataDirectory);
+        _listenLoad = LoadListensAsync(_listens, NoctisDataOf(host), epoch);
+        _listenTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+        _listenTimer.Tick += ListenTick; _listenTimer.Start();
         _command = host.RegisterTrackCommand("True Shuffle…", null, (Action<TrackInfo>)(_ => Open()));
         host.Settings.Changed += SettingsChanged;
         host.NowPlaying.TrackChanged += TrackChanged;
@@ -115,6 +137,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
         if (Application.Current?.ApplicationLifetime is not IClassicDesktopStyleApplicationLifetime desktop ||
             desktop.MainWindow?.DataContext is not object main) throw new InvalidOperationException("Noctis is not ready.");
         _bridge = new QueueBridge(main);
+        AttachQueueWatch();
     }
 
     private void RefreshButtons(object? sender, EventArgs e)
@@ -182,9 +205,10 @@ public sealed class TrueShufflePlugin : INoctisPlugin
         try
         {
             await _load;
+            await _listenLoad;
             await _refill; // a plan the old session is still making is finished first, so the two never meet
             if (_closed || epoch != _epoch || operation != _pending || !ReferenceEquals(window, _window)) return;
-            if (_historyError != null && mode != ShuffleMode.EqualChance)
+            if (_historyError != null && mode is not (ShuffleMode.EqualChance or ShuffleMode.ForYou))
                 throw new IOException("Remembered progress is unavailable. Use Equal chance, or inspect the plugin's cycle.json before continuing.");
             var bridge = _bridge!;
             // The native collections may only be read here, on the UI thread, and that is cheap. What
@@ -208,6 +232,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
             string? currentKey = keepCurrent ? current?.Key : null;
             bool explicitAllowed = bridge.ExplicitAllowed;
             var known = _seen.ToArray(); var knownLast = _last; var knownLastPath = _lastPath;
+            var forYou = mode == ShuffleMode.ForYou ? ForYouGather(bridge) : null;
             if (_window != null) _window.Status = "Preparing the queue…";
             var prepared = await Task.Run(() =>
             {
@@ -218,7 +243,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
                 var remembered = current != null ? history.Seen.Append(current.Key).ToArray() : history.Seen;
                 var built = ShuffleEngine.Build(entries.Select(e => e.Song)
                     .Where(s => s.Remote || (!string.IsNullOrWhiteSpace(s.Path) && File.Exists(s.Path))),
-                    mode, remembered, currentKey, history.Last, explicitAllowed, skipDisliked);
+                    mode, remembered, currentKey, history.Last, explicitAllowed, skipDisliked, rank: forYou == null ? null : ForYouRanker(forYou));
                 var native = entries.DistinctBy(e => e.Song.Key).ToDictionary(e => e.Song.Key);
                 var queue = built.Songs.Select(s => native[s.Key]).ToList();
                 var keys = queue.SelectMany(e => new[] { e.Song.Key, e.Song.LegacyKey }).ToHashSet(StringComparer.Ordinal);
@@ -248,7 +273,8 @@ public sealed class TrueShufflePlugin : INoctisPlugin
             var manualKeys = manualEntries.Select(t => t.Song.Key).ToHashSet(StringComparer.Ordinal);
             ordered = ordered.Where(t => !manualKeys.Contains(t.Song.Key)).ToList();
             // Only a window of the plan goes into Noctis's queue; the rest waits in _roll.
-            var first = ordered.Count > _windowSize ? ordered.GetRange(0, _windowSize) : ordered;
+            int windowSize = mode == ShuffleMode.ForYou ? Math.Min(_windowSize, ForYouWindow) : _windowSize;
+            var first = ordered.Count > windowSize ? ordered.GetRange(0, windowSize) : ordered;
             EndSession(cancelPending: false);
             _ownChange = true;
             try
@@ -277,7 +303,10 @@ public sealed class TrueShufflePlugin : INoctisPlugin
             MarkCurrent(persist: false);
             QueueSave();
             _buttons?.Selected(mode, scope);
-            Status($"{manual.Count + first.Count:N0} upcoming songs queued; more are added as you listen" + (mode == ShuffleMode.NeverPlayed ? " until no never-played song is left. " : ". ") +
+            if (mode == ShuffleMode.ForYou)
+                Status($"For you: {first.Count:N0} songs picked from your listening, your playlists and what is playing" + (manual.Count > 0 ? $", behind the {manual.Count:N0} you queued" : "") +
+                    ". More follow as you listen, and what you skip or finish changes the next picks. Repeat and similar-song Autoplay are suspended for this session.");
+            else Status($"{manual.Count + first.Count:N0} upcoming songs queued; more are added as you listen" + (mode == ShuffleMode.NeverPlayed ? " until no never-played song is left. " : ". ") +
                 (plan.NewCycle ? "A fresh cycle started because this source was exhausted. " : "") +
                 "Repeat and similar-song Autoplay are suspended for this session; Track Radio ended.");
             WatchQueue();
@@ -310,7 +339,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
             {
                 var bridge = _bridge!;
                 var upcoming = bridge.Upcoming();
-                if (upcoming.Count > _refillAt) return;
+                if (upcoming.Count > RefillAt(roll)) return;
                 var batch = TakeFromPlan(roll, bridge, upcoming);
                 if (batch.Count > 0)
                 {
@@ -318,7 +347,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
                     // what the user put next are left alone, and a song counts as heard only when it starts.
                     void Add() => bridge.AppendUpcoming(batch);
                     if (_priority != null) _priority.Own(Add); else Add();
-                    if (upcoming.Count + batch.Count > _refillAt) return;
+                    if (upcoming.Count + batch.Count > RefillAt(roll)) return;
                 }
                 if (roll.Remaining == 0 && !await PlanNextAsync(roll, bridge, epoch)) return;
             }
@@ -369,6 +398,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
         }
         bool explicitAllowed = bridge.ExplicitAllowed; var mode = roll.Mode; bool skipDisliked = roll.SkipDisliked;
         var known = _seen.ToArray(); var last = _last; int history = _historyVersion;
+        var forYou = mode == ShuffleMode.ForYou ? ForYouGather(bridge) : null;
         var planned = await Task.Run(() =>
         {
             var identities = roll.Identities;
@@ -378,7 +408,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
             var remembered = playing != null ? known.Append(playing).ToArray() : known;
             var built = ShuffleEngine.Build(entries.Select(e => e.Song)
                 .Where(s => s.Remote || (!string.IsNullOrWhiteSpace(s.Path) && File.Exists(s.Path))),
-                mode, remembered, playing, last, explicitAllowed, skipDisliked, upcoming: waiting);
+                mode, remembered, playing, last, explicitAllowed, skipDisliked, upcoming: waiting, rank: forYou == null ? null : ForYouRanker(forYou));
             var native = entries.DistinctBy(e => e.Song.Key).ToDictionary(e => e.Song.Key);
             var queue = built.Songs.Select(s => native[s.Key]).ToList();
             var keys = queue.SelectMany(e => new[] { e.Song.Key, e.Song.LegacyKey }).ToHashSet(StringComparer.Ordinal);
@@ -519,6 +549,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
             var mineRaw = upcoming.Where(t => mine.Contains(t.Native, ReferenceEqualityComparer.Instance)).ToList();
             bool explicitAllowed = bridge.ExplicitAllowed; var mode = roll.Mode; bool skipDisliked = roll.SkipDisliked;
             var known = _seen.ToArray(); var last = _last;
+            var forYou = mode == ShuffleMode.ForYou ? ForYouGather(bridge) : null;
             var identities = roll.Identities;
             var planned = await Task.Run(() =>
             {
@@ -528,7 +559,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
                 var remembered = playing != null ? known.Append(playing).ToArray() : known;
                 var built = ShuffleEngine.Build(entries.Select(e => e.Song)
                     .Where(s => s.Remote || (!string.IsNullOrWhiteSpace(s.Path) && File.Exists(s.Path))),
-                    mode, remembered, playing, last, explicitAllowed, skipDisliked, upcoming: waiting);
+                    mode, remembered, playing, last, explicitAllowed, skipDisliked, upcoming: waiting, rank: forYou == null ? null : ForYouRanker(forYou));
                 var native = entries.DistinctBy(e => e.Song.Key).ToDictionary(e => e.Song.Key);
                 var queue = built.Songs.Select(s => native[s.Key]).ToList();
                 var keys = queue.SelectMany(e => new[] { e.Song.Key, e.Song.LegacyKey }).ToHashSet(StringComparer.Ordinal);
@@ -588,6 +619,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
 
     private void TrackChanged(object? sender, EventArgs e)
     {
+        ListenChanged(); // the listening log follows every song, in a session or not
         if (_lease == null || _closed) return;
         if (_priority?.Replacing == true) return; // a song picked from a list is starting: OnPlayedNow takes it from here
         try
@@ -686,6 +718,206 @@ public sealed class TrueShufflePlugin : INoctisPlugin
         if (_window != null) _window.Status = "Normal Noctis playback controls restored. The arranged queue is kept.";
     }
 
+    // ── listening log ──
+
+    /// <summary>Noctis's own data folder (two above this plugin's), when this plugin's data sits where Noctis puts it.</summary>
+    private static string? NoctisDataOf(IPluginHost host)
+    {
+        var mine = Path.GetFullPath(host.DataDirectory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var parent = Path.GetDirectoryName(mine);
+        if (parent == null || !string.Equals(Path.GetFileName(parent), "plugin-data", StringComparison.OrdinalIgnoreCase)) return null;
+        return Path.GetDirectoryName(parent);
+    }
+    private string? NoctisData => _host == null ? null : NoctisDataOf(_host);
+
+    /// <summary>Our earlier records, and Noctis's play history from before them (read only, counted for less).</summary>
+    private async Task LoadListensAsync(ListenStore store, string? noctisData, int epoch)
+    {
+        try
+        {
+            var loaded = await Task.Run(() =>
+            {
+                var own = store.Load();
+                var since = own.Count > 0 ? own.Min(r => r.StartUtc) : DateTime.UtcNow;
+                var imported = noctisData == null ? new List<PlayRecord>() : NoctisHistory.Read(Path.Combine(noctisData, "play_history.json"), since);
+                return imported.Concat(own).OrderBy(r => r.StartUtc).ToList();
+            });
+            await Dispatcher.UIThread.InvokeAsync(() => { if (!_closed && epoch == _epoch) _plays.InsertRange(0, loaded); });
+        }
+        catch (Exception ex) { if (!_closed && epoch == _epoch) _host?.Log("listening history could not be read: " + ex.GetBaseException().Message); }
+    }
+
+    private void AttachQueueWatch()
+    {
+        if (_queueWatch != null || _bridge == null) return;
+        if (QueueBridge.Get(_bridge.Player, "UpNext") is System.Collections.Specialized.INotifyCollectionChanged events)
+        {
+            _queueWatch = events;
+            events.CollectionChanged += QueueChanged;
+        }
+    }
+
+    /// <summary>To play a song from a list Noctis replaces the whole queue first: the song that was playing was not skipped.</summary>
+    private void QueueChanged(object? sender, System.Collections.Specialized.NotifyCollectionChangedEventArgs e)
+    {
+        if (e.Action != System.Collections.Specialized.NotifyCollectionChangedAction.Reset || _queueReset) return;
+        _queueReset = true;
+        Dispatcher.UIThread.Post(() => _queueReset = false, DispatcherPriority.Send);
+    }
+
+    /// <summary>Once a second: how far the song got, and whether it is playing.</summary>
+    private void ListenTick(object? sender, EventArgs e)
+    {
+        if (_closed || _bridge == null) return;
+        try
+        {
+            AttachQueueWatch();
+            var player = _bridge.Player;
+            var current = QueueBridge.Get(player, "CurrentTrack");
+            var position = QueueBridge.Get(player, "Position") is TimeSpan p ? p : TimeSpan.Zero;
+            bool playing = QueueBridge.Get(player, "State")?.ToString() == "Playing";
+            if (current == null) { if (_tracker.Running) EndPlay(PlayEnd.Stopped, _tracker.Peek()?.Position ?? position); return; }
+            if (!_tracker.Running || !ReferenceEquals(current, _playing))
+            {
+                if (_tracker.Running) EndPlay(PlayEnd.Unknown, _tracker.Peek()?.Position ?? position);
+                StartPlay(current, position, playing);
+                return;
+            }
+            // The same song again from the top (Repeat One, or picked again): the last play finished.
+            if (_tracker.Peek() is { DurationMs: > 0 } now && position < TimeSpan.FromSeconds(3) && now.Position.TotalMilliseconds >= now.DurationMs - 3000)
+            {
+                EndPlay(PlayEnd.Finished, now.Position);
+                StartPlay(current, position, playing);
+                return;
+            }
+            _tracker.Sample(position, playing, Clock);
+        }
+        catch (Exception ex) { _host?.Log("listening log: " + ex.GetBaseException().Message); }
+    }
+
+    /// <summary>
+    /// A new song started (Noctis announces it before it resets the position, so the old song's last position is still
+    /// there). How the old one ended: picked over (the queue was replaced), gone back from, finished, or skipped with Next.
+    /// </summary>
+    private void ListenChanged()
+    {
+        if (_closed || _bridge == null) return;
+        try
+        {
+            var player = _bridge.Player;
+            var current = QueueBridge.Get(player, "CurrentTrack");
+            if (ReferenceEquals(current, _playing) && _tracker.Running) return;
+            if (_tracker.Running && _playing != null)
+            {
+                var peek = _tracker.Peek()!.Value;
+                var position = QueueBridge.Get(player, "Position") is TimeSpan p && p > TimeSpan.Zero ? p : peek.Position;
+                var remaining = peek.DurationMs > 0 ? TimeSpan.FromMilliseconds(peek.DurationMs) - position : TimeSpan.MaxValue;
+                bool wentBack = QueueBridge.Get(player, "UpNext") is System.Collections.IEnumerable upNext
+                    && upNext.Cast<object>().FirstOrDefault() is object head && ReferenceEquals(head, _playing);
+                bool advanced = QueueBridge.Get(player, "History") is System.Collections.IEnumerable history
+                    && history.Cast<object>().FirstOrDefault() is object last && ReferenceEquals(last, _playing);
+                bool replaced = _queueReset || _priority?.Replacing == true;
+                EndPlay(current == null ? PlayEnd.Stopped : PlayTracker.Classify(replaced, wentBack, advanced, remaining, peek.Coverage), position);
+            }
+            if (current != null) StartPlay(current, TimeSpan.Zero, playing: true);
+        }
+        catch (Exception ex) { _host?.Log("listening log: " + ex.GetBaseException().Message); }
+    }
+
+    private void StartPlay(object native, TimeSpan position, bool playing)
+    {
+        var raw = _bridge!.Raw(native);
+        var duration = QueueBridge.Get(native, "Duration") is TimeSpan d ? d : TimeSpan.Zero;
+        var pathKey = new Song(raw.Id, raw.Path, raw.Title, raw.Artist, raw.PlayCount, raw.Skip, raw.Explicit, raw.Disliked, raw.SnoozedUntil, raw.Remote).LegacyKey;
+        string origin = _lease != null && _roll != null && _session.Contains(pathKey)
+            ? (_roll.Mode == ShuffleMode.ForYou ? "for-you" : "true-shuffle") : "noctis";
+        _tracker.Start(raw.Id, pathKey, raw.Title, raw.Artist, duration, origin, DateTime.UtcNow, Clock, position, playing);
+        _playing = native;
+        _started.Add((raw.Id, DateTime.UtcNow));
+        if (_started.Count > 2000) _started.RemoveRange(0, 1000);
+    }
+
+    private void EndPlay(PlayEnd end, TimeSpan position)
+    {
+        var record = _tracker.End(end, position, DateTime.UtcNow, Clock);
+        _playing = null;
+        if (record == null || _listens == null) return;
+        if (record.ListenedMs == 0 && record.End != PlayEnd.Skipped) return; // nothing was heard: nothing to say
+        _plays.Add(record);
+        int epoch = _epoch;
+        _listens.Append(record, ex => Dispatcher.UIThread.Post(() =>
+        {
+            if (_closed || epoch != _epoch || _listenFailing) return;
+            _listenFailing = true;
+            Notice("Listening history could not be saved (" + ex.GetBaseException().Message + "). For you keeps working with what it has.");
+        }));
+    }
+
+    // ── For you ──
+
+    private int RefillAt(RollingQueue roll) => roll.Mode == ShuffleMode.ForYou ? Math.Min(_refillAt, ForYouRefillAt) : _refillAt;
+
+    /// <summary>What a For you plan needs from Noctis, read here on the UI thread; the plan itself is made on a worker.</summary>
+    internal sealed record ForYouInputs(List<TrackFacts> Facts, List<PlayRecord> Plays, List<string> Recent, List<string> Skipped,
+        double Exploration, int Count, int Seed, DateTime Now, string? PlaylistsPath);
+
+    private ForYouInputs ForYouGather(QueueBridge bridge)
+    {
+        ListenTick(null, EventArgs.Empty); // the song playing right now belongs to this sitting, even if the log has not looked yet
+        var now = DateTime.UtcNow;
+        var plays = _plays.ToList();
+        // This sitting: the songs started since the last break of 30 minutes or more, newest first, heard or not.
+        var recent = new List<string>();
+        if (bridge.CurrentRaw is { } playing) recent.Add(playing.Id);
+        var sittingSince = now;
+        for (int i = _started.Count - 1; i >= 0; i--)
+        {
+            if (sittingSince - _started[i].At > TimeSpan.FromMinutes(30)) break;
+            sittingSince = _started[i].At;
+            if (!recent.Contains(_started[i].Id)) recent.Add(_started[i].Id);
+        }
+        var skipped = plays.Where(p => !p.Imported && p.StartUtc >= sittingSince && p.Outcome == PlayOutcome.StrongSkip)
+            .Select(p => p.TrackId).Distinct().ToList();
+        double exploration = _host?.Settings.GetString("forYouDiscovery") switch { "Familiar" => 0.1, "Adventurous" => 0.35, _ => 0.2 };
+        var data = NoctisData;
+        return new(bridge.LibraryFacts(), plays, recent, skipped, exploration, Math.Min(_windowSize, ForYouWindow),
+            Environment.TickCount, now, data == null ? null : Path.Combine(data, "playlists.json"));
+    }
+
+    internal static Func<List<Song>, List<Song>> ForYouRanker(ForYouInputs input) => songs =>
+    {
+        var model = TasteModel.Build(input.Plays, input.Facts, ReadPlaylists(input.PlaylistsPath), input.Now);
+        var byId = new Dictionary<string, Song>(StringComparer.Ordinal);
+        foreach (var song in songs) byId.TryAdd(song.Id, song);
+        var plan = ForYouPlanner.Plan(byId.Keys.ToList(), model,
+            new ForYouContext(input.Recent, input.Skipped, input.Exploration, input.Count, input.Seed, input.Now));
+        return plan.Select(id => byId[id]).ToList();
+    };
+
+    /// <summary>The listener's own (not smart) playlists, from Noctis's playlists.json, read only; none when it cannot be read.</summary>
+    internal static List<IReadOnlyCollection<string>> ReadPlaylists(string? path)
+    {
+        var result = new List<IReadOnlyCollection<string>>();
+        try
+        {
+            if (path == null || !File.Exists(path) || (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0
+                || new FileInfo(path).Length > 64L * 1024 * 1024) return result;
+            using var doc = JsonDocument.Parse(File.ReadAllBytes(path));
+            var lists = doc.RootElement;
+            if (lists.ValueKind == JsonValueKind.Object && (lists.TryGetProperty("playlists", out var inner) || lists.TryGetProperty("Playlists", out inner))) lists = inner;
+            if (lists.ValueKind != JsonValueKind.Array) return result;
+            foreach (var list in lists.EnumerateArray())
+            {
+                if (list.ValueKind != JsonValueKind.Object) continue;
+                if ((list.TryGetProperty("isSmartPlaylist", out var smart) || list.TryGetProperty("IsSmartPlaylist", out smart)) && smart.ValueKind == JsonValueKind.True) continue;
+                if (!(list.TryGetProperty("trackIds", out var ids) || list.TryGetProperty("TrackIds", out ids)) || ids.ValueKind != JsonValueKind.Array) continue;
+                result.Add(ids.EnumerateArray().Where(i => i.ValueKind == JsonValueKind.String).Select(i => i.GetString()!).ToList());
+            }
+        }
+        catch (Exception) { }
+        return result;
+    }
+
     private void Notice(string text)
     {
         try { _host?.Notify(text); _host?.Log(text); } catch { }
@@ -696,6 +928,15 @@ public sealed class TrueShufflePlugin : INoctisPlugin
         _closed = true;
         ++_epoch; ++_pending;
         if (_buttonTimer != null) { _buttonTimer.Stop(); _buttonTimer.Tick -= RefreshButtons; _buttonTimer = null; }
+        if (_listenTimer != null) { _listenTimer.Stop(); _listenTimer.Tick -= ListenTick; _listenTimer = null; }
+        if (_queueWatch != null) { _queueWatch.CollectionChanged -= QueueChanged; _queueWatch = null; }
+        try
+        {
+            // Closing Noctis says nothing about the song that was playing: it is recorded as stopped.
+            if (_tracker.Running && _bridge != null)
+                EndPlay(PlayEnd.Stopped, QueueBridge.Get(_bridge.Player, "Position") is TimeSpan at ? at : _tracker.Peek()?.Position ?? TimeSpan.Zero);
+        }
+        catch (Exception) { }
         _buttons?.Dispose(); _buttons = null;
         _shortcut?.Dispose(); _shortcut = null;
         if (_host != null)
@@ -709,6 +950,6 @@ public sealed class TrueShufflePlugin : INoctisPlugin
         _bridge = null; _host = null;
         // The song that started last should not be forgotten because Noctis closed a moment later.
         // The writer never needs this thread, so waiting cannot deadlock; two seconds at most.
-        try { if (!_save.IsCompleted) _save.Wait(TimeSpan.FromSeconds(2)); } catch (Exception) { }
+        try { Task.WhenAll(_save, _listens?.Flushed ?? Task.CompletedTask).Wait(TimeSpan.FromSeconds(2)); } catch (Exception) { }
     }
 }

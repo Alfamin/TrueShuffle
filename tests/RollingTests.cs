@@ -152,6 +152,28 @@ internal static class RollingTests
             check(!ReferenceEquals(rig.PlanList(), firstPlan) && counts.Length > 0 && counts.SequenceEqual(counts.Order()), "Discovery makes its next plan from the play counts, least played first");
         }
 
+        // For you: a short window at a time, re-picked as the queue runs low, never a song twice, never the playing one.
+        using (var rig = new Rig(120, 200, 20))
+        {
+            rig.Apply(ShuffleMode.ForYou);
+            var first = rig.Queue;
+            check(first.Length == 25 && first.Distinct().Count() == 25 && !first.Contains(rig.Main.Player.CurrentTrack!.Id) && rig.Remaining == 0,
+                "For you queues a window of 25 picks, re-planned rather than drawn from one long plan");
+            var heard = new List<string> { rig.Main.Player.CurrentTrack!.Id };
+            bool neverEmpty = true, tidy = true;
+            for (int step = 0; step < 60 && neverEmpty; step++)
+            {
+                if (rig.Queue.Length == 0) { neverEmpty = false; break; }
+                rig.Next();
+                heard.Add(rig.Main.Player.CurrentTrack!.Id);
+                tidy &= rig.Queue.Distinct().Count() == rig.Queue.Length && !rig.Queue.Contains(rig.Main.Player.CurrentTrack!.Id);
+            }
+            check(neverEmpty && tidy, "For you keeps going across re-plans, with nothing queued twice");
+            check(heard.Take(60).Distinct().Count() == 60, "Within a sitting no song comes back: what was just heard rests");
+            check((string)typeof(TrueShufflePlugin).GetMethod("RefillAt", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(rig.Plugin, new[] { rig.Roll! })!.ToString()! == "6",
+                "For you re-picks when 6 songs are left, so a skip soon changes what comes");
+        }
+
         // A library smaller than the threshold is queued whole, and the session stays alive for later.
         using (var rig = new Rig(12, 200, 20))
         {

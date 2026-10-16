@@ -19,7 +19,7 @@ public sealed class ShuffleWindow : Window
     {
         Title = "True Shuffle"; Width = 560; Height = 720; MinWidth = 460; MinHeight = 570;
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
-        var modes = new[] { "Equal chance", "No repeats", "Discovery", "Never played only" };
+        var modes = new[] { "Equal chance", "No repeats", "Discovery", "Never played only", "For you" }; // in ShuffleMode order
         var scopes = new[] { "Current queue", "Open playlist", "Whole library" };
         int defaultMode = Array.IndexOf(modes, initialMode ?? "No repeats");
         var mode = new ComboBox { ItemsSource = modes, SelectedIndex = defaultMode < 0 ? 1 : defaultMode, HorizontalAlignment = HorizontalAlignment.Stretch };
@@ -30,7 +30,8 @@ public sealed class ShuffleWindow : Window
             0 => "Every eligible song has an equal chance. Favorites, ratings and play counts do not affect the order. Each queue contains a song once; a later reshuffle can choose it again.",
             1 => "Equal chances among songs not started in this cycle. Progress survives restarts and reshuffles. After every eligible song in this source has started, the next apply begins a fresh cycle.",
             2 => "Songs with the lowest Noctis play counts come first, with random order inside each count. Remembers cycle progress, so reshuffling does not bring the same songs back early.",
-            _ => "Only songs whose Noctis play count is zero and that have not started in a True Shuffle session. An empty result stays empty; it never falls back to familiar songs."
+            3 => "Only songs whose Noctis play count is zero and that have not started in a True Shuffle session. An empty result stays empty; it never falls back to familiar songs.",
+            _ => "Picked for you from how you listen: what you finish and what you skip early, your playlists, the artists you keep, and what fits the song playing now. About one in five is a song you have not heard yet. It adapts as you listen; nothing leaves your computer."
         };
         mode.SelectionChanged += (_, _) => Describe(); Describe();
         var keep = new CheckBox { Content = "Keep the current song playing", IsChecked = true };

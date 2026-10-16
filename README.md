@@ -1,5 +1,21 @@
 # True Shuffle for Noctis
 
+Version 1.5.0 adds **For you**, a mode next to the others under each source. Its picks come from how you listen:
+- what you finish, and what you skip early;
+- the playlists the playing song is in;
+- the artists you keep listening to;
+- what fits the song playing now: genre, artist, era, tempo and key.
+
+About one in five picks is a song you have not heard yet; the "For you: new songs" setting changes that share
+(Familiar, Balanced or Adventurous). It picks 25 songs at a time and re-picks when 6 are left, so what you skip or
+finish changes what comes next. It does not repeat a song within a sitting, rests songs heard in the last 12 hours,
+and keeps the songs you queued yourself first. Equal chance and the other modes are not affected by any of this.
+
+To learn your taste, True Shuffle now keeps a listening log, `listens.jsonl` in its data folder. It records each
+song's start, how much of it was heard (pauses and jumps ahead do not count), and how it ended. Only Next pressed
+early counts as a skip; finishing, picking another song, Previous, stopping and closing Noctis do not. Noctis's own
+play history from before the log began is read once, never changed, and counts for less. Nothing leaves your computer.
+
 Version 1.4.2 fixes changing modes during playback. Choosing a mode for **Current queue**
 in an active session keeps the session's full source, including songs beyond its 200-song
 window. It changes the upcoming order without restarting the playing song. Songs you queued

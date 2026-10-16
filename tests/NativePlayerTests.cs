@@ -388,6 +388,31 @@ internal static class NativePlayerTests
             var noRepeats = ApplyMode(ShuffleMode.NoRepeats, "Current queue"); Pump(() => noRepeats.IsCompleted); Settle();
             check(Upcoming().Take(ownBeforeMode.Length).SequenceEqual(ownBeforeMode) && Mine().SequenceEqual(ownBeforeMode) && Active(),
                 "Repeated mode changes preserve the user's own queue and leave the session running");
+
+            // The listening log on the installed player: how each song ended, read from the player when the next one starts.
+            var plays = (System.Collections.IList)Field("_plays")!;
+            var clock = TimeSpan.FromHours(1);
+            SetField("_testClock", (Func<TimeSpan>)(() => clock));
+            var tick = typeof(TrueShufflePlugin).GetMethod("ListenTick", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            void Tick() => tick.Invoke(plugin, new object?[] { null, EventArgs.Empty });
+            void Hear(int from, int to) { for (int s = from; s <= to; s++) { Set(player, "Position", TimeSpan.FromSeconds(s)); clock += TimeSpan.FromSeconds(1); Tick(); } }
+            PlayRecord LastPlay() => (PlayRecord)plays[plays.Count - 1]!;
+            Tick(); // the log takes up the song that is playing
+            Hear(0, 20);
+            int logged = plays.Count;
+            ((ICommand)Get(player, "NextCommand")!).Execute(null); Settle();
+            check(plays.Count == logged + 1 && LastPlay().End == PlayEnd.Skipped && LastPlay().Outcome == PlayOutcome.StrongSkip && Math.Abs(LastPlay().ListenedMs - 20_000) <= 1_000,
+                "Installed player: Next after 20 s of 3 min is logged as an early skip, with 20 s heard");
+            Hear(0, 178);
+            ((ICommand)Get(player, "NextCommand")!).Execute(null); Settle();
+            check(LastPlay().End == PlayEnd.Finished && LastPlay().Outcome == PlayOutcome.Completed, "Installed player: a song in its last seconds when the next starts is logged as finished");
+            Hear(0, 100);
+            var picked2 = songs.Cast<object>().First(t => !ReferenceEquals(t, Playing()) && !Upcoming().Contains(t));
+            replace.Invoke(player, new object[] { songs, songs.IndexOf(picked2) }); Settle();
+            check(LastPlay().End == PlayEnd.Replaced && LastPlay().Outcome == PlayOutcome.Qualified, "Installed player: picking another song after 100 s is logged as picked over, not as a skip");
+            Hear(0, 2);
+            ((ICommand)Get(player, "PreviousCommand")!).Execute(null); Settle();
+            check(LastPlay().End == PlayEnd.Previous && LastPlay().Outcome == PlayOutcome.Neutral, "Installed player: Previous is logged as going back, never as a skip");
         }
         finally
         {

@@ -7,7 +7,7 @@ using System.Text;
 
 namespace TrueShuffle;
 
-public enum ShuffleMode { EqualChance, NoRepeats, Discovery, NeverPlayed }
+public enum ShuffleMode { EqualChance, NoRepeats, Discovery, NeverPlayed, ForYou }
 public sealed record Song(string Id, string Path, string Title, string Artist, int PlayCount,
     bool Skip, bool Explicit, bool Disliked, DateTime? SnoozedUntil, bool Remote = false, string? IdentityKey = null)
 {
@@ -59,12 +59,12 @@ public static class ShuffleEngine
     public static bool StillWanted(Song song, ShuffleMode mode, ISet<string> seen, bool explicitAllowed, bool skipDisliked, DateTime now)
         => IsEligible(song, explicitAllowed, skipDisliked, now)
            && (mode != ShuffleMode.NeverPlayed || song.PlayCount == 0)
-           && (mode == ShuffleMode.EqualChance || !seen.Contains(song.Key));
+           && (mode is ShuffleMode.EqualChance or ShuffleMode.ForYou || !seen.Contains(song.Key)); // For you rests recent songs itself
 
     /// <param name="upcoming">Keys of songs that are already waiting in the queue: a later plan must not repeat them.</param>
     public static ShufflePlan Build(IEnumerable<Song> input, ShuffleMode mode, IEnumerable<string> remembered,
         string? current, string? last, bool explicitAllowed = true, bool skipDisliked = false,
-        DateTime? now = null, Func<int, int>? draw = null, ISet<string>? upcoming = null)
+        DateTime? now = null, Func<int, int>? draw = null, ISet<string>? upcoming = null, Func<List<Song>, List<Song>>? rank = null)
     {
         draw ??= RandomNumberGenerator.GetInt32;
         var pool = Eligible(input, explicitAllowed, skipDisliked, now ?? DateTime.UtcNow);
@@ -75,6 +75,9 @@ public static class ShuffleEngine
         int unplayed = available.Count(s => s.PlayCount == 0);
         bool reset = false;
         List<Song> result;
+        if (mode == ShuffleMode.ForYou)
+            // Not a cycle: the planner orders the songs by the listener's taste and leaves recent ones out itself.
+            return new(rank != null ? rank(available) : Permute(available, draw), seen, false, pool.Count, unplayed);
         if (mode == ShuffleMode.EqualChance) result = available;
         else
         {

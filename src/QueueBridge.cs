@@ -145,6 +145,37 @@ public sealed class QueueBridge
     /// <summary>What a native track says about itself; no file is opened.</summary>
     public RawTrack Raw(object native) => Read(native);
 
+    /// <summary>
+    /// The tags "For you" uses. Read on the UI thread like the rest; none of them opens a file. A property this Noctis
+    /// does not have is simply unknown (empty/zero), so an older or newer Noctis still gets recommendations.
+    /// </summary>
+    public TrackFacts Facts(object native)
+    {
+        var raw = Read(native);
+        string S(string p) => Optional(native, p) as string ?? "";
+        int I(string p) => Optional(native, p) is int v ? v : 0;
+        bool B(string p) => Optional(native, p) is true;
+        static DateTime? Utc(object? value) => value is DateTime t && t > DateTime.MinValue
+            ? (t.Kind == DateTimeKind.Local ? t.ToUniversalTime() : DateTime.SpecifyKind(t, DateTimeKind.Utc)) : null;
+        int duration = Optional(native, "Duration") is TimeSpan d ? (int)Math.Clamp(d.TotalMilliseconds, 0, int.MaxValue) : 0;
+        return new TrackFacts(raw.Id, new Song(raw.Id, raw.Path, raw.Title, raw.Artist, raw.PlayCount, raw.Skip, raw.Explicit,
+                raw.Disliked, raw.SnoozedUntil, raw.Remote).LegacyKey,
+            raw.Title, raw.Artist, S("AlbumArtist"), S("Album"), TrackFacts.SplitGenres(S("Genre")), I("Year"), I("Bpm"),
+            S("MusicalKey"), duration, raw.PlayCount, I("Rating"), B("IsFavorite"), raw.Disliked,
+            Utc(Optional(native, "LastPlayed")), Utc(Optional(native, "DateAdded")));
+    }
+
+    /// <summary>Tags of every library track (see <see cref="Facts"/>).</summary>
+    public List<TrackFacts> LibraryFacts() => ((IEnumerable)Get(_library, "Tracks")!).Cast<object>().Select(Facts).ToList();
+
+    private static readonly Dictionary<(Type, string), PropertyInfo?> _optional = new();
+    private static object? Optional(object o, string name)
+    {
+        var key = (o.GetType(), name);
+        if (!_optional.TryGetValue(key, out var property)) _optional[key] = property = Property(o, name);
+        try { return property?.GetValue(o); } catch { return null; }
+    }
+
     public TrackEntry Entry(object native)=>Wrap(native);
     public bool ExplicitAllowed => Get(_main, "Settings") is object s ? (bool)(Get(s, "AllowExplicitContent") ?? throw Changed()) : throw Changed();
 
