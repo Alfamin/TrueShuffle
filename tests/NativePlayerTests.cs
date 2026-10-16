@@ -360,6 +360,34 @@ internal static class NativePlayerTests
                 && queue.Skip(1).All(t => otherList.Contains(t)) && queue.Length == otherList.Count,
                 "A playlist's Shuffle button keeps the session: that playlist in the True Shuffle mode, behind the added song");
             shell.CurrentView = null;
+
+            // Change a mode while music is already playing: the rolling window is not the source,
+            // and the user's queue must survive replacing its observer as well as its visible rows.
+            var applyMethod = typeof(TrueShufflePlugin).GetMethod("ApplyAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            Task ApplyMode(ShuffleMode mode, string scope) => (Task)applyMethod.Invoke(plugin, new object[] { mode, scope, true, false })!;
+            var full = ApplyMode(ShuffleMode.EqualChance, "Whole library"); Pump(() => full.IsCompleted); Settle();
+            SetField("_seen", new HashSet<string>(StringComparer.Ordinal));
+            for (int i = 0; i < songs.Count; i++) Set(songs[i]!, "PlayCount", songs.Count - i);
+            var ownSong = songs.Cast<object>().First(t => !ReferenceEquals(t, Playing()));
+            Call("AddToQueue", ownSong); Settle();
+            var ownBeforeMode = Mine().ToArray();
+            var playingBeforeMode = Playing();
+            var audioCalls = (ServiceStub)args[0]!;
+            int playCalls = audioCalls.Calls.Count(c => c == "Play");
+            var discovery = ApplyMode(ShuffleMode.Discovery, "Current queue"); Pump(() => discovery.IsCompleted); Settle();
+            var expected = songs.Cast<object>().Where(t => !ReferenceEquals(t, playingBeforeMode) && !ownBeforeMode.Contains(t))
+                .OrderBy(t => (int)Get(t, "PlayCount")!).ToArray();
+            queue = Upcoming();
+            check(Active() && ReferenceEquals(Playing(), playingBeforeMode) && audioCalls.Calls.Count(c => c == "Play") == playCalls,
+                "Changing mode on the installed player takes effect without re-clicking a song or restarting audio");
+            check(queue.Take(ownBeforeMode.Length).SequenceEqual(ownBeforeMode) && queue.Skip(ownBeforeMode.Length).SequenceEqual(expected.Take(10)) && Mine().SequenceEqual(ownBeforeMode),
+                "Discovery keeps the user's request first, then the full source's lowest-play-count songs, with ownership preserved");
+            var plan = (List<TrackEntry>)Field("_roll")!.GetType().GetProperty("Plan")!.GetValue(Field("_roll"))!;
+            check(plan.Select(t => t.Native).SequenceEqual(expected) && queue.Count(t => ReferenceEquals(t, ownSong)) == 1,
+                "Changing mode retains songs beyond the rolling window and never duplicates a manual request");
+            var noRepeats = ApplyMode(ShuffleMode.NoRepeats, "Current queue"); Pump(() => noRepeats.IsCompleted); Settle();
+            check(Upcoming().Take(ownBeforeMode.Length).SequenceEqual(ownBeforeMode) && Mine().SequenceEqual(ownBeforeMode) && Active(),
+                "Repeated mode changes preserve the user's own queue and leave the session running");
         }
         finally
         {

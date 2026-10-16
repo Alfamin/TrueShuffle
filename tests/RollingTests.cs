@@ -13,6 +13,27 @@ internal static class RollingTests
 {
     public static void Run(Action<bool, string> check)
     {
+        // The button's top-level modes operate on the session's source, not just its visible window.
+        using (var rig = new Rig(12, 5, 2, track => track.PlayCount = 12 - int.Parse(track.Id)))
+        {
+            rig.Apply(ShuffleMode.EqualChance);
+            rig.Apply(ShuffleMode.Discovery, "Current queue");
+            var expected = rig.Main.Library.Tracks.Skip(1).OrderBy(t => t.PlayCount).Select(t => t.Id).ToArray();
+            check(rig.Plan().SequenceEqual(expected) && rig.Queue.SequenceEqual(expected.Take(5)), "Changing mode to Discovery keeps the full source behind the rolling window and takes effect immediately");
+            check(rig.Main.Player.CurrentTrack!.Id == "1" && rig.Main.Player.Replacements == 0, "Changing mode needs no song click and never restarts current playback");
+        }
+
+        using (var rig = new Rig(12, 5, 2))
+        {
+            var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            typeof(TrueShufflePlugin).GetField("_refill", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(rig.Plugin, gate.Task);
+            var first = rig.BeginApply(ShuffleMode.EqualChance);
+            var latest = rig.BeginApply(ShuffleMode.Discovery);
+            check(!latest.IsCompleted, "A mode selected during preparation is retained instead of silently dropped");
+            gate.SetResult(); Pump(() => first.IsCompleted && latest.IsCompleted); rig.Settle();
+            check(rig.Roll!.GetType().GetProperty("Mode")!.GetValue(rig.Roll) is ShuffleMode.Discovery, "The latest selected mode is applied after the pending preparation yields");
+        }
+
         // The window: only the first part of the plan is queued, in plan order; the rest waits in memory.
         using (var rig = new Rig(12, 5, 2))
         {
@@ -183,13 +204,15 @@ internal static class RollingTests
 
         private void Set(string name, object value) => typeof(TrueShufflePlugin).GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(Plugin, value);
 
-        public void Apply(ShuffleMode mode)
+        public void Apply(ShuffleMode mode, string scope = "Whole library")
         {
-            var apply = (Task)typeof(TrueShufflePlugin).GetMethod("ApplyAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
-                .Invoke(Plugin, new object[] { mode, "Whole library", true, false })!;
+            var apply = BeginApply(mode, scope);
             Pump(() => apply.IsCompleted);
             Settle();
         }
+        public Task BeginApply(ShuffleMode mode, string scope = "Whole library") => (Task)typeof(TrueShufflePlugin)
+            .GetMethod("ApplyAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .Invoke(Plugin, new object[] { mode, scope, true, false })!;
 
         /// <summary>The next song starts: the player takes it from the queue and says so.</summary>
         public void Advance()

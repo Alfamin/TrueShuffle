@@ -1,5 +1,12 @@
 # True Shuffle for Noctis
 
+Version 1.4.2 fixes changing modes during playback. Choosing a mode for **Current queue**
+in an active session keeps the session's full source, including songs beyond its 200-song
+window. It changes the upcoming order without restarting the playing song. Songs you queued
+yourself stay first and remain yours across repeated mode changes. If you pick another mode
+while preparation is running, the latest choice wins instead of being silently ignored.
+A queue with no other eligible songs points to **Whole library** and **Open playlist**.
+
 Version 1.4.1 fixes the switch to another playlist. When the shuffle held the whole library (for example a
 mode picked for the current queue after playing the Songs page from the top), a song played on the Gym
 playlist kept the library shuffle, because every Gym song is part of the library. What counts now is
@@ -194,9 +201,10 @@ runtime and cached Avalonia.Headless 12.1.3. It downloads nothing. Paths can be 
 
     & .\build.ps1
 
-The default build runs **158 assertions** before creating the plugin ZIP, covering uniform permutations,
+The default build runs **197 assertions** before creating the plugin ZIP, covering uniform permutations,
 2000-track membership, cycle restart/persistence, eligibility and discovery ordering, failed-append
-recovery, cancellation, lifecycle and preference restoration. Headless UI tests exercise the actual
+recovery, cancellation, lifecycle and preference restoration, mode changes during playback, full-source
+retention, manual-queue ownership and rapid mode selections. Headless UI tests exercise the actual
 window and plugin entry point with a fake host. Native integration uses the installed Noctis
 PlayerViewModel and Track types with fake audio/library/persistence services: it verifies exact queue
 order, uninterrupted current playback, Next/natural advance and drain while Autoplay/Repeat were

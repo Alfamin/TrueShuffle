@@ -39,7 +39,7 @@ public sealed class QueueFrontPolicy : IDisposable
     /// <param name="played">Called instead of <paramref name="replaced"/> when the replacement started a song (the user played it from a
     /// list, the queue panel or the history), with the songs that were upcoming until then.</param>
     public QueueFrontPolicy(object player, Action<IReadOnlyList<object>> admit, Action<string> error, Action? replaced = null,
-        Action<IReadOnlyList<object>>? played = null)
+        Action<IReadOnlyList<object>>? played = null, IReadOnlyList<object>? manual = null)
     {
         _replaced=replaced; _played=played;
         _player=player;
@@ -48,6 +48,7 @@ public sealed class QueueFrontPolicy : IDisposable
         _move=player.GetType().GetMethod("MoveInQueue",new[]{typeof(int),typeof(int)}) ?? throw new NotSupportedException("Native queue move is unavailable.");
         _remove=player.GetType().GetMethod("RemoveFromQueue",new[]{typeof(int)}) ?? throw new NotSupportedException("Native queue removal is unavailable.");
         _admit=admit; _error=error; _before=Snapshot();
+        if (manual != null) _manual.UnionWith(_before.Where(row => manual.Contains(row, ReferenceEqualityComparer.Instance)));
         _events.CollectionChanged+=Changed;
         if (played!=null && QueueBridge.Get(player,"History") is INotifyCollectionChanged history) { _history=history; history.CollectionChanged+=HistoryChanged; }
     }

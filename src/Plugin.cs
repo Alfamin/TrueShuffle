@@ -15,7 +15,7 @@ namespace TrueShuffle;
 
 public sealed class TrueShufflePlugin : INoctisPlugin
 {
-    public PluginInfo Info { get; } = new("dev.moshi.trueshuffle", "True Shuffle", "1.4.1", "moshi",
+    public PluginInfo Info { get; } = new("dev.moshi.trueshuffle", "True Shuffle", "1.4.2", "moshi",
         "Equal-chance shuffle, persistent no-repeat cycles, and discovery modes for your queue, playlist or library.");
     private IPluginHost? _host;
     private IDisposable? _command;
@@ -42,6 +42,7 @@ public sealed class TrueShufflePlugin : INoctisPlugin
     // when the queue is down to _refillAt songs (the tests use small numbers).
     private RollingQueue? _roll;
     private Task _refill = Task.CompletedTask;
+    private Task _apply = Task.CompletedTask;
     private int _windowSize = 200, _refillAt = 20;
 
     public void Initialize(IPluginHost host)
@@ -158,9 +159,25 @@ public sealed class TrueShufflePlugin : INoctisPlugin
 
     private async Task ApplyAsync(ShuffleMode mode, string scope, bool keepCurrent, bool skipDisliked)
     {
-        if (_busy || _closed || _bridge == null) return;
+        if (_closed || _bridge == null) return;
         int epoch = _epoch, operation = ++_pending;
         var window = _window;
+        // A second menu click supersedes preparation of the first; it must not silently disappear.
+        var previous = _apply;
+        var complete = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _apply = complete.Task;
+        try
+        {
+            await previous;
+            if (_closed || epoch != _epoch || operation != _pending || !ReferenceEquals(window, _window)) return;
+            await ApplyCoreAsync(mode, scope, keepCurrent, skipDisliked, epoch, operation, window);
+        }
+        finally { complete.TrySetResult(); }
+    }
+
+    private async Task ApplyCoreAsync(ShuffleMode mode, string scope, bool keepCurrent, bool skipDisliked,
+        int epoch, int operation, ShuffleWindow? window)
+    {
         _busy = true; if (_window != null) _window.Busy = true;
         try
         {
@@ -169,13 +186,24 @@ public sealed class TrueShufflePlugin : INoctisPlugin
             if (_closed || epoch != _epoch || operation != _pending || !ReferenceEquals(window, _window)) return;
             if (_historyError != null && mode != ShuffleMode.EqualChance)
                 throw new IOException("Remembered progress is unavailable. Use Equal chance, or inspect the plugin's cycle.json before continuing.");
-            var bridge = _bridge;
+            var bridge = _bridge!;
             // The native collections may only be read here, on the UI thread, and that is cheap. What
             // costs is each song's file identity (it opens the file): that, the history upgrade, the
             // shuffle and the session keys are all worked out on a thread of our own.
-            var raw = bridge.SnapshotRaw(scope);
-            var openPlaylist = scope == "Open playlist" ? bridge.OpenPlaylistId : null;
-            var libraryRaw = scope == "Whole library" ? raw : bridge.SnapshotRaw("Whole library");
+            var sourceSnapshot = bridge.SnapshotRaw(scope);
+            var libraryRaw = scope == "Whole library" ? sourceSnapshot : bridge.SnapshotRaw("Whole library");
+            var continuing = scope == "Current queue" && _lease != null ? _roll : null;
+            var sourceScope = continuing?.Scope ?? scope;
+            var openPlaylist = continuing?.Playlist ?? (scope == "Open playlist" ? bridge.OpenPlaylistId : null);
+            var raw = sourceSnapshot;
+            if (continuing != null)
+            {
+                // The native queue holds only a window of the source. Changing mode must retain
+                // the unheard songs beyond it, even if its window has drained in the meantime.
+                var byId = libraryRaw.GroupBy(t => t.Id).ToDictionary(g => g.Key, g => g.First());
+                raw = continuing.Members == null ? libraryRaw : continuing.Members
+                    .Select(m => byId.TryGetValue(m.Id, out var fresh) ? fresh : m.Remote ? m : null).OfType<RawTrack>().ToList();
+            }
             var current = bridge.Current?.Song;
             string? currentKey = keepCurrent ? current?.Key : null;
             bool explicitAllowed = bridge.ExplicitAllowed;
@@ -201,16 +229,24 @@ public sealed class TrueShufflePlugin : INoctisPlugin
             _seen = new(upgraded.Seen,StringComparer.Ordinal); _last=upgraded.Last; _historyVersion++;
             if (keepCurrent && bridge.Current?.Song.Key != currentKey)
                 throw new InvalidOperationException("The playing song changed while preparing. Apply again to keep the new song.");
-            if (bridge.ExplicitAllowed != explicitAllowed || !raw.SequenceEqual(bridge.SnapshotRaw(scope)))
+            if (bridge.ExplicitAllowed != explicitAllowed || (continuing != null
+                ? !ReferenceEquals(_roll, continuing) || !libraryRaw.SequenceEqual(bridge.SnapshotRaw("Whole library"))
+                : !sourceSnapshot.SequenceEqual(bridge.SnapshotRaw(scope))))
                 throw new InvalidOperationException("The source or playback policy changed while preparing. Apply again to use the updated selection.");
             if (plan.Songs.Count == 0)
             {
-                Status(mode == ShuffleMode.NeverPlayed ? "No eligible never-played songs remain in this source. Try Discovery or another source." : "No eligible upcoming songs in this source. Nothing was changed.");
+                Status(mode == ShuffleMode.NeverPlayed ? "No eligible never-played songs remain in this source. Try Discovery or another source."
+                    : scope == "Current queue" && continuing == null ? "This queue has no other eligible songs. Choose Whole library or Open playlist in the shuffle menu."
+                    : "No eligible upcoming songs in this source. Nothing was changed.");
                 return;
             }
             var previousSeen = new HashSet<string>(_seen, StringComparer.Ordinal);
             var previousLast = _last;
             var previousLastPath = _lastPath;
+            var manual = _priority?.Manual(bridge.Upcoming().Select(t => t.Native)) ?? new List<object>();
+            var manualEntries = manual.Select(bridge.Entry).ToList();
+            var manualKeys = manualEntries.Select(t => t.Song.Key).ToHashSet(StringComparer.Ordinal);
+            ordered = ordered.Where(t => !manualKeys.Contains(t.Song.Key)).ToList();
             // Only a window of the plan goes into Noctis's queue; the rest waits in _roll.
             var first = ordered.Count > _windowSize ? ordered.GetRange(0, _windowSize) : ordered;
             EndSession(cancelPending: false);
@@ -219,10 +255,11 @@ public sealed class TrueShufflePlugin : INoctisPlugin
             {
                 _lease = new PlaybackLease(bridge.Player);
                 _session = prepared.session;
+                foreach (var entry in manualEntries) { _session.Add(entry.Song.Key); _session.Add(entry.Song.LegacyKey); }
                 if (currentKey != null) { _session.Add(currentKey); _session.Add(current!.LegacyKey); }
                 _seen = new(plan.Seen, StringComparer.Ordinal);
                 if (bridge.Player is INotifyPropertyChanged events) events.PropertyChanged += PlayerChanged;
-                bridge.Apply(first, keepCurrent);
+                bridge.Apply(manualEntries.Concat(first).ToList(), keepCurrent);
                 if (QueueBridge.Get(bridge.Player,"UpNext") is System.Collections.Specialized.INotifyCollectionChanged)
                     _priority=new QueueFrontPolicy(bridge.Player, requested=>
                     {
@@ -232,15 +269,15 @@ public sealed class TrueShufflePlugin : INoctisPlugin
                             _session.Add(song.Key);_session.Add(song.LegacyKey);
                         }
                         Notice($"{requested.Count} song{(requested.Count==1 ? "" : "s")} queued ahead of the shuffle.");
-                    },Notice,OnQueueReplaced,OnPlayedNow);
-                _roll = new RollingQueue(mode, scope, skipDisliked, scope == "Whole library" ? null : raw, ordered, first.Count, prepared.identities) { Playlist = openPlaylist };
+                    },Notice,OnQueueReplaced,OnPlayedNow,manual);
+                _roll = new RollingQueue(mode, sourceScope, skipDisliked, sourceScope == "Whole library" ? null : raw, ordered, first.Count, prepared.identities) { Playlist = openPlaylist };
             }
             catch { _seen = previousSeen; _last = previousLast; _lastPath = previousLastPath; EndSession(); throw; }
             finally { _ownChange = false; }
             MarkCurrent(persist: false);
             QueueSave();
             _buttons?.Selected(mode, scope);
-            Status($"{first.Count:N0} upcoming songs queued; more are added as you listen" + (mode == ShuffleMode.NeverPlayed ? " until no never-played song is left. " : ". ") +
+            Status($"{manual.Count + first.Count:N0} upcoming songs queued; more are added as you listen" + (mode == ShuffleMode.NeverPlayed ? " until no never-played song is left. " : ". ") +
                 (plan.NewCycle ? "A fresh cycle started because this source was exhausted. " : "") +
                 "Repeat and similar-song Autoplay are suspended for this session; Track Radio ended.");
             WatchQueue();
